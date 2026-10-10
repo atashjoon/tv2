@@ -2,6 +2,7 @@
   "name": "trendify-nexus-installer-v2",
   "version": "1.0.0",
   "private": true,
+  "type": "commonjs",
   "description": "Trendify Nexus Installer",
   "main": "index.js",
   "scripts": {
