@@ -1,259 +1,460 @@
 
-const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+"use strict";
+
+/* =========================================================
+   TRENDIFY NEXUS INSTALLER V2
+   Runtime: Node.js 22 / Railway
+   Module system: CommonJS
+========================================================= */
+
+const http = require("node:http");
+const crypto = require("node:crypto");
+
+const PORT = Number(process.env.PORT || 3000);
+const HOST = "0.0.0.0";
+
+const APP_NAME = "Trendify Nexus Installer";
+const APP_VERSION = "2.0.0";
+
+const JSON_HEADERS = {
+  "Content-Type": "application/json; charset=utf-8",
+  "Cache-Control": "no-store",
+  "X-Content-Type-Options": "nosniff",
 };
 
-function json(data, status = 200) {
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Max-Age": "86400",
+};
+
+/* =========================================================
+   RESPONSE HELPERS
+========================================================= */
+
+function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
-      ...CORS,
-      "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store",
+      ...JSON_HEADERS,
+      ...CORS_HEADERS,
+      ...extraHeaders,
     },
   });
 }
 
-function randomHex(bytes = 24) {
-  return Array.from(
-    crypto.getRandomValues(new Uint8Array(bytes)),
-    x => x.toString(16).padStart(2, "0")
-  ).join("");
+function textResponse(message, status = 200) {
+  return new Response(String(message), {
+    status,
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-store",
+      ...CORS_HEADERS,
+    },
+  });
+}
+
+function errorMessage(error) {
+  return error instanceof Error
+    ? error.message
+    : String(error || "Unknown error");
+}
+
+function randomHex(bytes = 4) {
+  return crypto.randomBytes(bytes).toString("hex");
+}
+
+function randomSecret(bytes = 32) {
+  return crypto.randomBytes(bytes).toString("hex");
 }
 
 function base64UTF8(value) {
-  const bytes = new TextEncoder().encode(value);
-  let binary = "";
+  return Buffer.from(String(value), "utf8").toString("base64");
+}
 
-  for (let i = 0; i < bytes.length; i += 8192) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+function normalizeString(value, maxLength = 500) {
+  return String(value ?? "")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function isValidIdentifier(value) {
+  return /^[a-zA-Z0-9_-]{1,100}$/.test(String(value || ""));
+}
+
+/* =========================================================
+   REQUEST BODY
+========================================================= */
+
+async function readJson(request) {
+  const contentType = request.headers.get("content-type") || "";
+
+  if (!contentType.toLowerCase().includes("application/json")) {
+    throw new Error("Content-Type must be application/json");
   }
 
-  return btoa(binary);
+  const raw = await request.text();
+
+  if (!raw || raw.length > 2 * 1024 * 1024) {
+    throw new Error("Request body is empty or exceeds 2 MB");
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error("Invalid JSON request body");
+  }
 }
 
-async function github(url, token, options = {}) {
-  return fetch(url, {
-    ...options,
-    headers: {
-      Authorization: "Bearer " + token,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "Installer",
-      ...(options.headers || {}),
-    },
-  });
+/* =========================================================
+   EXTERNAL API HELPER
+========================================================= */
+
+async function apiRequest(url, options = {}, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+
+    const raw = await response.text();
+
+    let data;
+
+    try {
+      data = raw ? JSON.parse(raw) : {};
+    } catch {
+      data = { raw };
+    }
+
+    if (!response.ok) {
+      const details =
+        data?.errors?.map((item) => item.message).filter(Boolean).join("; ") ||
+        data?.message ||
+        data?.error ||
+        raw ||
+        `HTTP ${response.status}`;
+
+      throw new Error(details);
+    }
+
+    return data;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("External API request timed out");
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
-async function cf(path, token, options = {}) {
-  const response = await fetch(
-    "https://api.cloudflare.com/client/v4" + path,
+/* =========================================================
+   GITHUB API
+========================================================= */
+
+async function github(path, token, options = {}) {
+  if (!token) {
+    throw new Error("GitHub token is required");
+  }
+
+  const normalizedPath = String(path || "").replace(/^\/+/, "");
+
+  return apiRequest(
+    "https://api.github.com/" + normalizedPath,
     {
       ...options,
       headers: {
-        Authorization: "Bearer " + token,
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+        ...(options.headers || {}),
+      },
+    }
+  );
+}
+
+/* =========================================================
+   CLOUDFLARE API
+========================================================= */
+
+async function cf(path, token, options = {}) {
+  if (!token) {
+    throw new Error("Cloudflare API token is required");
+  }
+
+  const normalizedPath = String(path || "").replace(/^\/+/, "");
+
+  const result = await apiRequest(
+    "https://api.cloudflare.com/client/v4/" + normalizedPath,
+    {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${token}`,
         ...(options.headers || {}),
       },
     }
   );
 
-  const raw = await response.text();
-  let data;
+  if (result?.success === false) {
+    const messages = (result.errors || [])
+      .map((item) => item.message)
+      .filter(Boolean);
 
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    data = { success: false, errors: [{ message: raw }] };
-  }
-
-  if (!response.ok || data.success === false) {
-    const details = (data.errors || [])
-      .map(x => x.message || JSON.stringify(x))
-      .join("; ");
-
-    throw new Error("Cloudflare API: " + (details || response.status));
-  }
-
-  return data.result;
-}
-
-async function putRepoFile(owner, repo, path, content, token) {
-  const url =
-    "https://api.github.com/repos/" +
-    owner + "/" + repo + "/contents/" + path;
-
-  const existing = await github(url, token);
-  let sha;
-
-  if (existing.ok) {
-    sha = (await existing.json()).sha;
-  } else if (existing.status !== 404) {
     throw new Error(
-      "GitHub read failed (" + path + "): " + await existing.text()
+      messages.join("; ") || "Cloudflare API request failed"
     );
   }
 
-  const response = await github(url, token, {
+  return result;
+}
+
+/* =========================================================
+   GITHUB REPOSITORY FILE UPLOAD
+========================================================= */
+
+async function putRepoFile({
+  token,
+  owner,
+  repo,
+  path,
+  content,
+  message,
+  branch,
+}) {
+  if (!token || !owner || !repo || !path) {
+    throw new Error("Missing GitHub repository parameters");
+  }
+
+  const safePath = String(path)
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+
+  const endpoint =
+    `repos/${encodeURIComponent(owner)}/` +
+    `${encodeURIComponent(repo)}/contents/${safePath}`;
+
+  const payload = {
+    message: message || `Add ${path}`,
+    content: base64UTF8(content),
+  };
+
+  if (branch) {
+    payload.branch = branch;
+  }
+
+  return github(endpoint, token, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message: "Create relay deployment files",
-      content: base64UTF8(content),
-      ...(sha ? { sha } : {}),
-    }),
+    body: JSON.stringify(payload),
   });
-
-  if (!response.ok) {
-    throw new Error(
-      "GitHub upload failed (" + path + "): " + await response.text()
-    );
-  }
 }
 
-/* =========================
-   TCP RELAY
-========================= */
+/* =========================================================
+   INSTALLATION INPUT VALIDATION
+========================================================= */
+
+function validateInstallInput(input) {
+  const githubToken = normalizeString(input.githubToken, 500);
+  const cloudflareToken = normalizeString(input.cloudflareToken, 500);
+  const accountId = normalizeString(input.accountId, 100);
+  const telegramBotToken = normalizeString(input.telegramBotToken, 200);
+  const telegramAdminId = normalizeString(input.telegramAdminId, 100);
+
+  const missing = [];
+
+  if (!githubToken) missing.push("githubToken");
+  if (!cloudflareToken) missing.push("cloudflareToken");
+  if (!accountId) missing.push("accountId");
+  if (!telegramBotToken) missing.push("telegramBotToken");
+  if (!telegramAdminId) missing.push("telegramAdminId");
+
+  if (missing.length) {
+    throw new Error(
+      "Missing required fields: " + missing.join(", ")
+    );
+  }
+
+  if (!/^[a-f0-9]{32}$/i.test(accountId)) {
+    throw new Error("Cloudflare Account ID must contain 32 hexadecimal characters");
+  }
+
+  if (!/^\d+$/.test(telegramAdminId)) {
+    throw new Error("Telegram Admin ID must be numeric");
+  }
+
+  return {
+    githubToken,
+    cloudflareToken,
+    accountId,
+    telegramBotToken,
+    telegramAdminId,
+  };
+}
+
+/* =========================================================
+   END OF PART 1
+   Add PART 2 directly below this line.
+========================================================= */
+
+/* =========================================================
+   PART 2A — RAILWAY TCP RELAY SOURCE
+========================================================= */
 
 const RELAY_SOURCE = String.raw`
-import net from "node:net";
-import { timingSafeEqual } from "node:crypto";
+"use strict";
+
+const net = require("node:net");
 
 const PORT = Number(process.env.PORT || 443);
-const SECRET = String(process.env.RELAY_SECRET || "");
-const MAX_SECRET_LENGTH = 256;
+const RELAY_SECRET = String(process.env.RELAY_SECRET || "");
 
-if (!SECRET) {
-  console.error("RELAY_SECRET is required");
+if (RELAY_SECRET.length < 16) {
+  console.error("RELAY_SECRET must contain at least 16 characters");
   process.exit(1);
 }
 
-const expectedSecret = Buffer.from(SECRET, "utf8");
+const server = net.createServer((client) => {
+  client.setTimeout(30000);
 
-if (expectedSecret.length < 16 || expectedSecret.length > MAX_SECRET_LENGTH) {
-  console.error("Invalid RELAY_SECRET length");
-  process.exit(1);
-}
-
-const server = net.createServer(client => {
-  client.setNoDelay(true);
-
-  let remote = null;
   let buffer = Buffer.alloc(0);
-  let stage = "secretLength";
+  let state = "secret-length";
   let secretLength = 0;
   let hostLength = 0;
-  let finished = false;
+  let targetHost = "";
+  let targetPort = 0;
+  let upstream = null;
 
-  const timer = setTimeout(() => {
-    if (stage !== "connected") client.destroy();
-  }, 10000);
-
-  function reject(reason) {
-    if (finished) return;
-    finished = true;
-    clearTimeout(timer);
-    console.log("REJECT:", reason);
+  function fail(message) {
+    console.error("Relay connection rejected:", message);
     client.destroy();
-    remote?.destroy();
+    if (upstream) upstream.destroy();
   }
 
-  function onData(chunk) {
-    if (finished) return;
-
-    buffer = Buffer.concat([buffer, chunk]);
-
-    while (true) {
-      if (stage === "secretLength") {
+  function processBuffer() {
+    while (!client.destroyed) {
+      if (state === "secret-length") {
         if (buffer.length < 2) return;
+
         secretLength = buffer.readUInt16BE(0);
         buffer = buffer.subarray(2);
 
-        if (secretLength < 16 || secretLength > MAX_SECRET_LENGTH) {
-          return reject("Invalid secret length");
+        if (secretLength < 16 || secretLength > 256) {
+          return fail("Invalid secret length");
         }
 
-        stage = "secret";
+        state = "secret";
       }
 
-      if (stage === "secret") {
+      if (state === "secret") {
         if (buffer.length < secretLength) return;
 
-        const received = buffer.subarray(0, secretLength);
+        const suppliedSecret = buffer
+          .subarray(0, secretLength)
+          .toString("utf8");
+
         buffer = buffer.subarray(secretLength);
 
-        if (
-          received.length !== expectedSecret.length ||
-          !timingSafeEqual(received, expectedSecret)
-        ) {
-          return reject("Authentication failed");
+        if (suppliedSecret !== RELAY_SECRET) {
+          return fail("Invalid relay secret");
         }
 
-        stage = "hostLength";
+        state = "host-length";
       }
 
-      if (stage === "hostLength") {
+      if (state === "host-length") {
         if (buffer.length < 2) return;
+
         hostLength = buffer.readUInt16BE(0);
         buffer = buffer.subarray(2);
 
-        if (hostLength < 1 || hostLength > 255) {
-          return reject("Invalid host length");
+        if (hostLength < 1 || hostLength > 253) {
+          return fail("Invalid hostname length");
         }
 
-        stage = "target";
+        state = "host";
       }
 
-      if (stage === "target") {
-        if (buffer.length < hostLength + 2) return;
+      if (state === "host") {
+        if (buffer.length < hostLength) return;
 
-        const host = buffer.subarray(0, hostLength).toString("utf8");
-        const port = buffer.readUInt16BE(hostLength);
-        const payload = buffer.subarray(hostLength + 2);
-        buffer = Buffer.alloc(0);
-        stage = "connecting";
+        targetHost = buffer
+          .subarray(0, hostLength)
+          .toString("utf8");
+
+        buffer = buffer.subarray(hostLength);
 
         if (
-          !host ||
-          /[\0\r\n]/.test(host) ||
-          !Number.isInteger(port) ||
-          port < 1 ||
-          port > 65535
+          !targetHost ||
+          /[\r\n\0]/.test(targetHost) ||
+          targetHost.includes("/")
         ) {
-          return reject("Invalid destination");
+          return fail("Invalid destination hostname");
         }
 
-        clearTimeout(timer);
-        client.pause();
-        client.removeListener("data", onData);
+        state = "port";
+      }
 
-        try {
-          remote = net.connect({ host, port });
-          remote.setNoDelay(true);
+      if (state === "port") {
+        if (buffer.length < 2) return;
 
-          remote.once("connect", () => {
-            if (finished) return remote.destroy();
+        targetPort = buffer.readUInt16BE(0);
+        buffer = buffer.subarray(2);
 
-            stage = "connected";
-            console.log("CONNECTED:", host, port);
-
-            if (payload.length) remote.write(payload);
-
-            client.pipe(remote);
-            remote.pipe(client);
-            client.resume();
-          });
-
-          remote.on("error", err => {
-            console.log("REMOTE ERROR:", err.message);
-            client.destroy();
-          });
-
-          remote.on("close", () => client.destroy());
-        } catch (err) {
-          reject(err.message);
+        if (targetPort < 1 || targetPort > 65535) {
+          return fail("Invalid destination port");
         }
+
+        state = "connecting";
+
+        upstream = net.createConnection({
+          host: targetHost,
+          port: targetPort,
+        });
+
+        upstream.setTimeout(30000);
+
+        upstream.once("connect", () => {
+          if (client.destroyed) {
+            upstream.destroy();
+            return;
+          }
+
+          console.log(
+            "Relay connected:",
+            targetHost + ":" + targetPort
+          );
+
+          client.setTimeout(0);
+          upstream.setTimeout(0);
+
+          if (buffer.length > 0) {
+            upstream.write(buffer);
+            buffer = Buffer.alloc(0);
+          }
+
+          client.pipe(upstream);
+          upstream.pipe(client);
+        });
+
+        upstream.once("error", (error) => {
+          console.error("Destination connection failed:", error.message);
+          client.destroy();
+        });
+
+        upstream.once("close", () => {
+          if (!client.destroyed) client.destroy();
+        });
+
+        client.once("close", () => {
+          if (upstream && !upstream.destroyed) upstream.destroy();
+        });
 
         return;
       }
@@ -262,28 +463,40 @@ const server = net.createServer(client => {
     }
   }
 
-  client.on("data", onData);
-  client.on("error", err => {
-    console.log("CLIENT ERROR:", err.message);
-    remote?.destroy();
+  client.on("data", (chunk) => {
+    if (state === "connecting") {
+      if (upstream && !upstream.destroyed) upstream.write(chunk);
+      return;
+    }
+
+    buffer = Buffer.concat([buffer, chunk]);
+
+    if (buffer.length > 8192) {
+      return fail("Handshake buffer too large");
+    }
+
+    processBuffer();
   });
-  client.on("close", () => {
-    finished = true;
-    clearTimeout(timer);
-    remote?.destroy();
+
+  client.on("timeout", () => fail("Connection timed out"));
+  client.on("error", (error) => {
+    console.error("Client socket error:", error.message);
   });
 });
 
-server.on("error", err => console.error("SERVER ERROR:", err));
+server.on("error", (error) => {
+  console.error("Relay server error:", error);
+  process.exitCode = 1;
+});
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Authenticated TCP Relay listening on", PORT);
+  console.log("Trendify Nexus Relay listening on port " + PORT);
 });
 `;
 
-/* =========================
-   VLESS GATEWAY
-========================= */
+/* =========================================================
+   PART 2B — CLOUDFLARE GATEWAY WORKER SOURCE
+========================================================= */
 
 const GATEWAY_SOURCE = String.raw`
 import { connect } from "cloudflare:sockets";
@@ -292,232 +505,324 @@ function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-      "access-control-allow-origin": "*"
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Access-Control-Allow-Origin": "*"
     }
   });
 }
 
-function uuidFromBytes(bytes) {
-  const h = Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
-  return h.slice(0,8) + "-" + h.slice(8,12) + "-" +
-    h.slice(12,16) + "-" + h.slice(16,20) + "-" + h.slice(20,32);
+function equalBytes(a, b) {
+  if (a.length !== b.length) return false;
+
+  let result = 0;
+
+  for (let i = 0; i < a.length; i++) {
+    result |= a[i] ^ b[i];
+  }
+
+  return result === 0;
 }
 
-function decodeEarlyData(value) {
-  if (!value) return null;
-  try {
-    const binary = atob(value.replace(/-/g, "+").replace(/_/g, "/"));
-    return Uint8Array.from(binary, c => c.charCodeAt(0));
-  } catch {
-    return null;
+function parseUUID(value) {
+  const normalized = String(value || "").replace(/-/g, "");
+
+  if (!/^[0-9a-fA-F]{32}$/.test(normalized)) {
+    throw new Error("Invalid UUID configuration");
   }
+
+  const bytes = new Uint8Array(16);
+
+  for (let i = 0; i < 16; i++) {
+    bytes[i] = parseInt(normalized.slice(i * 2, i * 2 + 2), 16);
+  }
+
+  return bytes;
 }
 
-async function bytesOf(data) {
-  if (data instanceof ArrayBuffer) return new Uint8Array(data);
-  if (ArrayBuffer.isView(data)) {
-    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+function parseVlessHeader(data, env) {
+  if (data.length < 24) {
+    throw new Error("VLESS header is incomplete");
   }
-  if (data && typeof data.arrayBuffer === "function") {
-    return new Uint8Array(await data.arrayBuffer());
+
+  const version = data[0];
+  const clientUUID = data.subarray(1, 17);
+  const configuredUUID = parseUUID(env.UUID);
+
+  if (!equalBytes(clientUUID, configuredUUID)) {
+    throw new Error("Invalid VLESS UUID");
   }
-  throw new Error("Unsupported WebSocket data");
-}
 
-function parseVLESS(bytes) {
-  if (bytes.length < 24) throw new Error("VLESS header too short");
+  const optionLength = data[17];
+  const commandOffset = 18 + optionLength;
 
-  const version = bytes[0];
-  const uuid = uuidFromBytes(bytes.slice(1, 17));
-  let i = 18 + bytes[17];
+  if (data.length < commandOffset + 4) {
+    throw new Error("VLESS destination header is incomplete");
+  }
 
-  if (i + 4 > bytes.length) throw new Error("Invalid VLESS header");
+  const command = data[commandOffset];
 
-  const command = bytes[i++];
-  if (command !== 1) throw new Error("Only VLESS TCP is supported");
+  if (command !== 1) {
+    throw new Error("Only VLESS TCP is supported");
+  }
 
-  const port = (bytes[i++] << 8) | bytes[i++];
-  const type = bytes[i++];
-  let host = "";
+  const port = (data[commandOffset + 1] << 8) |
+    data[commandOffset + 2];
 
-  if (type === 1) {
-    if (i + 4 > bytes.length) throw new Error("Invalid IPv4");
-    host = Array.from(bytes.slice(i, i + 4)).join(".");
-    i += 4;
-  } else if (type === 2) {
-    if (i >= bytes.length) throw new Error("Invalid domain");
-    const length = bytes[i++];
-    if (i + length > bytes.length) throw new Error("Invalid domain length");
-    host = new TextDecoder().decode(bytes.slice(i, i + length));
-    i += length;
-  } else if (type === 3) {
-    if (i + 16 > bytes.length) throw new Error("Invalid IPv6");
-    const parts = [];
-    for (let n = 0; n < 16; n += 2) {
-      parts.push(((bytes[i+n] << 8) | bytes[i+n+1]).toString(16));
+  const addressType = data[commandOffset + 3];
+  let offset = commandOffset + 4;
+  let hostname = "";
+
+  if (addressType === 1) {
+    if (data.length < offset + 4) {
+      throw new Error("Incomplete IPv4 address");
     }
-    host = parts.join(":");
-    i += 16;
+
+    hostname = Array.from(data.subarray(offset, offset + 4)).join(".");
+    offset += 4;
+  } else if (addressType === 2) {
+    if (data.length < offset + 1) {
+      throw new Error("Incomplete domain length");
+    }
+
+    const length = data[offset++];
+
+    if (data.length < offset + length) {
+      throw new Error("Incomplete domain address");
+    }
+
+    hostname = new TextDecoder().decode(
+      data.subarray(offset, offset + length)
+    );
+
+    offset += length;
+  } else if (addressType === 3) {
+    if (data.length < offset + 16) {
+      throw new Error("Incomplete IPv6 address");
+    }
+
+    const parts = [];
+
+    for (let i = 0; i < 16; i += 2) {
+      parts.push(
+        ((data[offset + i] << 8) | data[offset + i + 1]).toString(16)
+      );
+    }
+
+    hostname = parts.join(":");
+    offset += 16;
   } else {
-    throw new Error("Unknown address type");
+    throw new Error("Unsupported VLESS address type");
   }
 
-  if (!host || port < 1 || port > 65535) {
+  if (!hostname || port < 1 || port > 65535) {
     throw new Error("Invalid destination");
   }
 
-  return { version, uuid, host, port, payload: bytes.slice(i) };
+  return {
+    version,
+    hostname,
+    port,
+    payload: data.subarray(offset)
+  };
 }
 
-async function handleVLESS(request, env) {
+async function handleVless(request, env) {
   if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-    return new Response("WebSocket Required", { status: 426 });
+    return new Response("WebSocket upgrade required", { status: 426 });
+  }
+
+  if (!env.UUID) {
+    return new Response("UUID is not configured", { status: 500 });
   }
 
   if (
-    !env.UUID || !env.RELAY_SECRET || !env.RELAY_HOST ||
-    !env.RELAY_PORT || env.RELAY_HOST === "SET_AFTER_RAILWAY_DEPLOY"
+    !env.RELAY_HOST ||
+    !env.RELAY_PORT ||
+    !env.RELAY_SECRET
   ) {
-    return new Response("Gateway environment is incomplete", { status: 503 });
+    return new Response("Relay configuration is incomplete", { status: 500 });
   }
 
   const pair = new WebSocketPair();
   const client = pair[0];
   const ws = pair[1];
+
   ws.accept();
 
-  let socket;
-  let writer;
+  let relaySocket = null;
   let closed = false;
-  let firstResponse = true;
-  let chain = Promise.resolve();
+  let initialized = false;
+  let queued = [];
 
   function closeAll() {
     if (closed) return;
     closed = true;
-    try { writer?.releaseLock(); } catch {}
-    try { socket?.close(); } catch {}
-    try { ws.close(); } catch {}
+
+    try {
+      if (relaySocket) relaySocket.close();
+    } catch {}
+
+    try {
+      ws.close();
+    } catch {}
   }
 
-  async function connectRelay(parsed) {
-    const secret = new TextEncoder().encode(env.RELAY_SECRET);
-    const host = new TextEncoder().encode(parsed.host);
-    const relayPort = Number(env.RELAY_PORT);
-
-    if (secret.length < 16 || secret.length > 256) {
-      throw new Error("Invalid relay secret");
-    }
-    if (!host.length || host.length > 255) {
-      throw new Error("Invalid destination hostname");
-    }
-    if (!Number.isInteger(relayPort) || relayPort < 1 || relayPort > 65535) {
-      throw new Error("Invalid relay port");
-    }
-
-    socket = connect({
-      hostname: String(env.RELAY_HOST).trim(),
-      port: relayPort
-    });
-
-    await socket.opened;
-    if (closed) return socket.close();
-
-    writer = socket.writable.getWriter();
-
-    const frame = new Uint8Array(
-      2 + secret.length + 2 + host.length + 2 + parsed.payload.length
-    );
-
-    let offset = 0;
-    frame[offset++] = (secret.length >> 8) & 255;
-    frame[offset++] = secret.length & 255;
-    frame.set(secret, offset);
-    offset += secret.length;
-
-    frame[offset++] = (host.length >> 8) & 255;
-    frame[offset++] = host.length & 255;
-    frame.set(host, offset);
-    offset += host.length;
-
-    frame[offset++] = (parsed.port >> 8) & 255;
-    frame[offset++] = parsed.port & 255;
-    frame.set(parsed.payload, offset);
-
-    await writer.write(frame);
-
-    socket.readable.pipeTo(new WritableStream({
-      write(chunk) {
-        if (closed || ws.readyState !== WebSocket.OPEN) return;
-
-        if (firstResponse) {
-          firstResponse = false;
-          const response = new Uint8Array(chunk.length + 2);
-          response[0] = parsed.version;
-          response[1] = 0;
-          response.set(chunk, 2);
-          ws.send(response);
-        } else {
-          ws.send(chunk);
-        }
-      }
-    })).catch(err => {
-      if (!closed) console.log("RELAY STREAM ERROR", err.message);
-    }).finally(closeAll);
-  }
-
-  async function onMessage(data) {
-    const bytes = await bytesOf(data);
-
-    if (writer) {
-      await writer.write(bytes);
-      return;
-    }
-
-    const parsed = parseVLESS(bytes);
-
-    if (parsed.uuid.toLowerCase() !== String(env.UUID).toLowerCase()) {
-      throw new Error("UUID mismatch");
-    }
-
-    await connectRelay(parsed);
-  }
-
-  function enqueue(data) {
-    chain = chain.then(() => onMessage(data)).catch(err => {
-      console.log("VLESS ERROR:", err.message);
-      closeAll();
-    });
-  }
-
-  const early = decodeEarlyData(
-    request.headers.get("sec-websocket-protocol")
-  );
-  if (early?.length) enqueue(early);
-
-  ws.addEventListener("message", event => enqueue(event.data));
   ws.addEventListener("close", closeAll);
   ws.addEventListener("error", closeAll);
 
-  const headers = {};
-  const protocol = request.headers.get("sec-websocket-protocol");
-  if (protocol) headers["sec-websocket-protocol"] = protocol;
+  ws.addEventListener("message", async (event) => {
+    try {
+      let data;
 
-  return new Response(null, { status: 101, webSocket: client, headers });
+      if (typeof event.data === "string") {
+        data = new TextEncoder().encode(event.data);
+      } else if (event.data instanceof ArrayBuffer) {
+        data = new Uint8Array(event.data);
+      } else if (ArrayBuffer.isView(event.data)) {
+        data = new Uint8Array(
+          event.data.buffer,
+          event.data.byteOffset,
+          event.data.byteLength
+        );
+      } else {
+        throw new Error("Unsupported WebSocket message type");
+      }
+
+      if (!initialized) {
+        queued.push(data);
+
+        const combinedLength = queued.reduce(
+          (sum, item) => sum + item.length,
+          0
+        );
+
+        if (combinedLength < 24) return;
+
+        const combined = new Uint8Array(combinedLength);
+        let position = 0;
+
+        for (const item of queued) {
+          combined.set(item, position);
+          position += item.length;
+        }
+
+        queued = [];
+
+        const parsed = parseVlessHeader(combined, env);
+
+        relaySocket = connect({
+          hostname: env.RELAY_HOST,
+          port: Number(env.RELAY_PORT)
+        });
+
+        const writer = relaySocket.writable.getWriter();
+
+        const encoder = new TextEncoder();
+        const secret = encoder.encode(String(env.RELAY_SECRET));
+        const host = encoder.encode(parsed.hostname);
+
+        if (secret.length > 256 || host.length > 253) {
+          throw new Error("Relay handshake field is too long");
+        }
+
+        const handshake = new Uint8Array(
+          2 + secret.length + 2 + host.length + 2
+        );
+
+        let offset = 0;
+
+        handshake[offset++] = (secret.length >> 8) & 255;
+        handshake[offset++] = secret.length & 255;
+        handshake.set(secret, offset);
+        offset += secret.length;
+
+        handshake[offset++] = (host.length >> 8) & 255;
+        handshake[offset++] = host.length & 255;
+        handshake.set(host, offset);
+        offset += host.length;
+
+        handshake[offset++] = (parsed.port >> 8) & 255;
+        handshake[offset] = parsed.port & 255;
+
+        await writer.write(handshake);
+
+        if (parsed.payload.length > 0) {
+          await writer.write(parsed.payload);
+        }
+
+        writer.releaseLock();
+
+        initialized = true;
+
+        const responseHeader = new Uint8Array([
+          parsed.version,
+          0
+        ]);
+
+        ws.send(responseHeader);
+
+        const readable = relaySocket.readable;
+
+        (async () => {
+          const reader = readable.getReader();
+
+          try {
+            while (!closed) {
+              const result = await reader.read();
+
+              if (result.done) break;
+
+              if (result.value && result.value.length) {
+                ws.send(result.value);
+              }
+            }
+          } catch {
+            closeAll();
+          } finally {
+            try {
+              reader.releaseLock();
+            } catch {}
+
+            closeAll();
+          }
+        })();
+
+        return;
+      }
+
+      if (relaySocket && !closed) {
+        const writer = relaySocket.writable.getWriter();
+
+        try {
+          await writer.write(data);
+        } finally {
+          writer.releaseLock();
+        }
+      }
+    } catch (error) {
+      console.log("VLESS connection error:", error.message);
+      closeAll();
+    }
+  });
+
+  return new Response(null, {
+    status: 101,
+    webSocket: client
+  });
 }
 
-async function handleInstall(request) {
+export default {
+  async fetch(request, env) {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
         headers: {
-          "access-control-allow-origin": "*",
-          "access-control-allow-methods": "GET,POST,OPTIONS",
-          "access-control-allow-headers": "*"
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type"
         }
       });
     }
@@ -525,7 +830,7 @@ async function handleInstall(request) {
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({
         success: true,
-        gateway: "Gateway",
+        gateway: "Trendify Nexus Gateway",
         gateway_id: env.GATEWAY_ID || null,
         region: env.GATEWAY_REGION || "eu",
         status: "online",
@@ -534,7 +839,7 @@ async function handleInstall(request) {
     }
 
     if (url.pathname === "/ws" || url.pathname.startsWith("/ws/")) {
-      return handleVLESS(request, env);
+      return handleVless(request, env);
     }
 
     return new Response("Not Found", { status: 404 });
@@ -542,39 +847,63 @@ async function handleInstall(request) {
 };
 `;
 
-/* =========================
-   TELEGRAM BOT WORKER
-========================= */
+/* =========================================================
+   END OF PART 2
+   Add PART 3 below this line.
+========================================================= */
+
+/* =========================================================
+   PART 3A — TELEGRAM BOT WORKER SOURCE
+========================================================= */
 
 const BOT_SOURCE = String.raw`
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store"
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store"
     }
   });
 }
 
-async function sendMessage(env, chatId, text) {
+async function sendMessage(env, chatId, message) {
   const response = await fetch(
-    "https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/sendMessage",
+    "https://api.telegram.org/bot" +
+      env.TELEGRAM_BOT_TOKEN +
+      "/sendMessage",
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text })
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: message
+      })
     }
   );
 
-  if (!response.ok) throw new Error("Telegram sendMessage failed");
+  if (!response.ok) {
+    throw new Error("Telegram sendMessage failed: HTTP " + response.status);
+  }
+
+  const result = await response.json();
+
+  if (!result.ok) {
+    throw new Error(result.description || "Telegram API error");
+  }
+
+  return result;
 }
 
-async function handleInstall(request) {
+export default {
+  async fetch(request, env) {
     const url = new URL(request.url);
 
     if (url.pathname === "/") {
-      return json({ success: true, service: "Telegram Bot Webhook" });
+      return json({
+        success: true,
+        service: "Trendify Nexus Telegram Bot"
+      });
     }
 
     if (url.pathname !== "/telegram-webhook") {
@@ -588,13 +917,20 @@ async function handleInstall(request) {
     if (
       !env.TELEGRAM_BOT_TOKEN ||
       !env.TELEGRAM_ADMIN_ID ||
-      !env.BOT_WEBHOOK_SECRET ||
-      request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.BOT_WEBHOOK_SECRET
+      !env.BOT_WEBHOOK_SECRET
+    ) {
+      return new Response("Bot configuration missing", { status: 500 });
+    }
+
+    if (
+      request.headers.get("X-Telegram-Bot-Api-Secret-Token") !==
+      env.BOT_WEBHOOK_SECRET
     ) {
       return new Response("Unauthorized", { status: 401 });
     }
 
     let update;
+
     try {
       update = await request.json();
     } catch {
@@ -602,37 +938,40 @@ async function handleInstall(request) {
     }
 
     const message = update.message;
-    if (!message?.text || !message.chat?.id) {
+
+    if (!message?.text || !message?.chat?.id) {
       return json({ success: true });
     }
 
-    const command = message.text.trim().split(/\s+/)[0].split("@")[0];
     const senderId = String(message.from?.id || "");
     const chatId = message.chat.id;
+    const command = message.text
+      .trim()
+      .split(/\s+/)[0]
+      .split("@")[0];
+
     const isAdmin = senderId === String(env.TELEGRAM_ADMIN_ID);
 
     try {
       if (command === "/start" || command === "/help") {
-        await sendMessage(
-          env,
-          chatId,
-          isAdmin
-            ? "ربات فعال است. برای راهنما /help را بزن.\\nمدیریت کاربران هنوز به API پنل متصل نشده است."
-            : "ربات فعال است. برای دسترسی مدیریتی با مدیر سیستم تماس بگیر."
-        );
+        const responseText = isAdmin
+          ? "Trendify Nexus Bot فعال است.\n\nدستورهای موجود:\n/start - شروع\n/help - راهنما\n/id - نمایش شناسه تلگرام\n\nتوجه: مدیریت کاربران تا زمان اتصال API پنل فعال نیست."
+          : "سلام! ربات Trendify Nexus فعال است. برای دسترسی مدیریتی با مدیر سیستم تماس بگیرید.";
+
+        await sendMessage(env, chatId, responseText);
       } else if (command === "/id") {
         await sendMessage(env, chatId, "Telegram ID: " + senderId);
       } else if (isAdmin) {
         await sendMessage(
           env,
           chatId,
-          "این ربات هنوز به API پنل متصل نشده است؛ مدیریت کاربران و اشتراک‌ها در دسترس نیست."
+          "ربات فعال است، اما عملیات مدیریتی تا اتصال به API پنل در دسترس نیست."
         );
       } else {
         await sendMessage(env, chatId, "این دستور در دسترس نیست.");
       }
-    } catch (err) {
-      console.log("Telegram handler error:", err.message);
+    } catch (error) {
+      console.log("Telegram handler error:", error.message);
     }
 
     return json({ success: true });
@@ -640,428 +979,793 @@ async function handleInstall(request) {
 };
 `;
 
-/* =========================
-   CLOUDFLARE WORKER DEPLOY
-========================= */
+/* =========================================================
+   PART 3B — CLOUDFLARE WORKER DEPLOYMENT
+========================================================= */
 
-async function deployWorker(
+async function deployWorker({
   accountId,
   token,
   workerName,
   source,
-  bindings,
-  secretNames = []
-) {
+  bindings = [],
+  compatibilityDate = "2026-10-01"
+}) {
+  if (!isValidIdentifier(workerName)) {
+    throw new Error("Invalid Cloudflare Worker name");
+  }
+
   const metadata = {
     main_module: "index.js",
-    compatibility_date: "2026-10-10",
-    bindings: Object.entries(bindings).map(([name, value]) => ({
-      type: secretNames.includes(name) ? "secret_text" : "plain_text",
-      name,
-      text: String(value),
-    })),
+    compatibility_date: compatibilityDate,
+    bindings
   };
 
   const form = new FormData();
-  form.append("metadata", JSON.stringify(metadata));
+
+  form.append(
+    "metadata",
+    new Blob(
+      [JSON.stringify(metadata)],
+      { type: "application/json" }
+    )
+  );
+
   form.append(
     "index.js",
-    new Blob([source], { type: "application/javascript+module" }),
+    new Blob(
+      [source],
+      { type: "application/javascript+module" }
+    ),
     "index.js"
   );
 
-  await cf(
-    "/accounts/" + accountId + "/workers/scripts/" + workerName + "/content",
-    token,
-    { method: "PUT", body: form }
-  );
-
-  await cf(
-    "/accounts/" + accountId + "/workers/scripts/" + workerName + "/subdomain",
+  const result = await cf(
+    "accounts/" +
+      encodeURIComponent(accountId) +
+      "/workers/scripts/" +
+      encodeURIComponent(workerName),
     token,
     {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled: true }),
+      body: form
     }
   );
-}
 
-/* =========================
-   INSTALLER API
-========================= */
-
-export default {
-  async fetch(request) {
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS });
-    }
-
-    if (request.method !== "POST") {
-      return json({
-        success: false,
-        message: "Method Not Allowed",
-      }, 405);
-    }
-
-    let repository = null;
-    let workerName = null;
-    let botWorkerName = null;
-    let repoCreated = false;
-
-    try {
-      const body = await request.json();
-
-      const githubToken = String(body.githubToken || "").trim();
-      const cloudflareToken = String(body.cloudflareToken || "").trim();
-      const accountId = String(body.accountId || "").trim();
-      const telegramBotToken = String(body.telegramBotToken || "").trim();
-      const telegramAdminId = String(body.telegramAdminId || "").trim();
-
-      if (
-        !githubToken ||
-        !cloudflareToken ||
-        !accountId ||
-        !telegramBotToken ||
-        !/^-?\d+$/.test(telegramAdminId)
-      ) {
-        return json({
-          success: false,
-          message: "همه فیلدها الزامی هستند و شناسه ادمین تلگرام باید عددی باشد.",
-        }, 400);
-      }
-
-      /* Validate Cloudflare token */
-      const tokenCheck = await cf("/user/tokens/verify", cloudflareToken);
-
-      if (tokenCheck.status !== "active") {
-        throw new Error("Cloudflare API Token فعال نیست.");
-      }
-
-      /* Validate GitHub token */
-      const userResponse = await github(
-        "https://api.github.com/user",
-        githubToken
-      );
-
-      if (!userResponse.ok) {
-        throw new Error("GitHub Token معتبر نیست یا دسترسی کافی ندارد.");
-      }
-
-      const user = await userResponse.json();
-      const owner = user.login;
-
-      /* Validate Telegram token before creating resources */
-      const telegramCheck = await fetch(
-        "https://api.telegram.org/bot" + telegramBotToken + "/getMe"
-      );
-
-      const telegramData = await telegramCheck.json();
-
-      if (!telegramCheck.ok || !telegramData.ok) {
-        throw new Error("توکن ربات تلگرام معتبر نیست.");
-      }
-
-      const botUsername = telegramData.result.username;
-
-      /* Get workers.dev subdomain before creating resources */
-      const accountInfo = await cf(
-        "/accounts/" + accountId + "/workers/subdomain",
-        cloudflareToken
-      );
-
-      const subdomain = accountInfo.subdomain;
-
-      if (!subdomain) {
-        throw new Error(
-          "ابتدا workers.dev subdomain را در تنظیمات Cloudflare فعال کن."
-        );
-      }
-
-      /* Random names: 12 hexadecimal characters */
-      const repoName = randomHex(6);
-      workerName = randomHex(6);
-      botWorkerName = randomHex(6);
-
-      const gatewayId = randomHex(6);
-      const relaySecret = randomHex(32);
-      const webhookSecret = randomHex(32);
-      const uuid = crypto.randomUUID();
-
-      /* Create GitHub repository */
-      const createRepo = await github(
-        "https://api.github.com/user/repos",
-        githubToken,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            name: repoName,
-            description: "Authenticated TCP relay",
-            private: false,
-            auto_init: true,
-          }),
-        }
-      );
-
-      if (!createRepo.ok) {
-        throw new Error(
-          "ساخت مخزن GitHub ناموفق بود: " + await createRepo.text()
-        );
-      }
-
-      repoCreated = true;
-      repository = "https://github.com/" + owner + "/" + repoName;
-
-      const packageJson = JSON.stringify({
-        name: repoName,
-        version: "1.0.0",
-        private: true,
-        type: "module",
-        main: "server.js",
-        scripts: { start: "node server.js" },
-        engines: { node: ">=20" },
-      }, null, 2);
-
-      const dockerfile = [
-        "FROM node:22-alpine",
-        "WORKDIR /app",
-        "COPY package.json .",
-        "COPY server.js .",
-        "EXPOSE 443",
-        'CMD ["npm", "start"]',
-      ].join("\n");
-
-      const railwayJson = JSON.stringify({
-        $schema: "https://railway.app/railway.schema.json",
-        deploy: {
-          startCommand: "npm start",
-          restartPolicyType: "ON_FAILURE",
-          restartPolicyMaxRetries: 10,
-        },
-      }, null, 2);
-
-      const readme = [
-        "# Authenticated TCP Relay",
-        "",
-        "## Required environment variables",
-        "- PORT=443",
-        "- RELAY_SECRET: set this in Railway variables; never commit it.",
-        "",
-        "## Deployment",
-        "1. Deploy this repository to Railway.",
-        "2. Set PORT=443 and RELAY_SECRET in Railway variables.",
-        "3. Create a Railway TCP Proxy targeting internal port 443.",
-        "4. Update RELAY_HOST and RELAY_PORT in the Cloudflare Gateway.",
-        "",
-        "The installer does not automatically create the Railway service or TCP Proxy.",
-      ].join("\n");
-
-      const files = {
-        "server.js": RELAY_SOURCE,
-        "package.json": packageJson,
-        "Dockerfile": dockerfile,
-        "railway.json": railwayJson,
-        "README.md": readme,
-      };
-
-      for (const [path, content] of Object.entries(files)) {
-        await putRepoFile(owner, repoName, path, content, githubToken);
-      }
-
-      /* Deploy Gateway; secret is a secret binding */
-      await deployWorker(
-        accountId,
-        cloudflareToken,
-        workerName,
-        GATEWAY_SOURCE,
-        {
-          UUID: uuid,
-          RELAY_HOST: "SET_AFTER_RAILWAY_DEPLOY",
-          RELAY_PORT: "443",
-          RELAY_SECRET: relaySecret,
-          GATEWAY_ID: gatewayId,
-          GATEWAY_REGION: "eu",
-        },
-        ["RELAY_SECRET"]
-      );
-
-      /* Deploy Telegram Worker */
-      await deployWorker(
-        accountId,
-        cloudflareToken,
-        botWorkerName,
-        BOT_SOURCE,
-        {
-          TELEGRAM_BOT_TOKEN: telegramBotToken,
-          TELEGRAM_ADMIN_ID: telegramAdminId,
-          BOT_WEBHOOK_SECRET: webhookSecret,
-        },
-        ["TELEGRAM_BOT_TOKEN", "BOT_WEBHOOK_SECRET"]
-      );
-
-      const workerUrl =
-        "https://" + workerName + "." + subdomain + ".workers.dev";
-
-      const botWorkerUrl =
-        "https://" + botWorkerName + "." + subdomain + ".workers.dev";
-
-      /* Configure Telegram webhook */
-      const webhookResponse = await fetch(
-        "https://api.telegram.org/bot" + telegramBotToken + "/setWebhook",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            url: botWorkerUrl + "/telegram-webhook",
-            secret_token: webhookSecret,
-            allowed_updates: ["message"],
-          }),
-        }
-      );
-
-      const webhookData = await webhookResponse.json();
-
-      if (!webhookResponse.ok || !webhookData.ok) {
-        throw new Error(
-          "ساخت Worker انجام شد، اما تنظیم Webhook ناموفق بود: " +
-          (webhookData.description || "خطای نامشخص")
-        );
-      }
-
-      return json({
-        success: true,
-        message: "مخزن GitHub، Gateway و Worker ربات تلگرام ساخته شدند.",
-        repository,
-        workerName,
-        workerUrl,
-        gatewayId,
-        uuid,
-        botWorkerName,
-        botWorkerUrl,
-        botUsername,
-        requiredRailwayVariables: {
-          PORT: "443",
-          RELAY_SECRET: relaySecret,
-        },
-        requiredGatewayVariablesAfterRailway: {
-          RELAY_HOST: "Railway TCP Proxy hostname, without port",
-          RELAY_PORT: "Railway TCP Proxy public port",
-        },
-        note:
-          "Railway و TCP Proxy هنوز باید جداگانه تنظیم شوند. " +
-          "ربات تلگرام فعلاً به API مدیریت کاربران و اشتراک‌ها متصل نیست.",
-      });
-    } catch (error) {
-      return json({
-        success: false,
-        message: error?.message || "Installer failed.",
-        repositoryMayHaveBeenCreated: repoCreated,
-        repository,
-        workerName,
-        botWorkerName,
-      }, 500);
-    }
+  if (result?.success === false) {
+    throw new Error(
+      (result.errors || [])
+        .map((item) => item.message)
+        .filter(Boolean)
+        .join("; ") || "Worker deployment failed"
+    );
   }
 
-/* =========================
-   NODE.JS HTTP SERVER
-========================= */
+  return result;
+}
 
-require("node:http")
-  .createServer(async (req, res) => {
-    try {
-      const chunks = [];
-      let totalSize = 0;
-      const maxBodySize = 2 * 1024 * 1024;
+/* =========================================================
+   PART 3C — CLOUDFLARE WORKER SECRETS
+========================================================= */
 
-      for await (const chunk of req) {
-        totalSize += chunk.length;
+async function setWorkerSecret({
+  accountId,
+  token,
+  workerName,
+  secretName,
+  secretValue
+}) {
+  if (!isValidIdentifier(workerName)) {
+    throw new Error("Invalid Worker name");
+  }
 
-        if (totalSize > maxBodySize) {
-          res.writeHead(413, {
-            "Content-Type": "application/json; charset=utf-8",
-          });
-          res.end(JSON.stringify({
-            success: false,
-            message: "Request body too large",
-          }));
-          return;
-        }
+  if (!/^[A-Z][A-Z0-9_]{0,99}$/.test(secretName)) {
+    throw new Error("Invalid Worker secret name");
+  }
 
-        chunks.push(chunk);
+  const result = await cf(
+    "accounts/" +
+      encodeURIComponent(accountId) +
+      "/workers/scripts/" +
+      encodeURIComponent(workerName) +
+      "/secrets",
+    token,
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        name: secretName,
+        text: String(secretValue),
+        type: "secret_text"
+      })
+    }
+  );
+
+  return result;
+}
+
+/* =========================================================
+   PART 3D — SET TELEGRAM WEBHOOK
+========================================================= */
+
+async function setTelegramWebhook({
+  botToken,
+  webhookUrl,
+  webhookSecret
+}) {
+  if (!botToken || !webhookUrl || !webhookSecret) {
+    throw new Error("Telegram webhook parameters are missing");
+  }
+
+  if (!/^https:\/\//i.test(webhookUrl)) {
+    throw new Error("Telegram webhook URL must use HTTPS");
+  }
+
+  if (!/^[A-Za-z0-9_-]{1,256}$/.test(webhookSecret)) {
+    throw new Error("Invalid Telegram webhook secret format");
+  }
+
+  const response = await apiRequest(
+    "https://api.telegram.org/bot" +
+      encodeURIComponent(botToken) +
+      "/setWebhook",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        url: webhookUrl,
+        secret_token: webhookSecret,
+        allowed_updates: ["message"]
+      })
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      response.description || "Telegram webhook setup failed"
+    );
+  }
+
+  return response;
+}
+
+/* =========================================================
+   PART 3E — CLOUDFLARE TOKEN VALIDATION
+========================================================= */
+
+async function validateCloudflareToken(token, accountId) {
+  const result = await cf("user/tokens/verify", token);
+
+  if (result?.success === false) {
+    throw new Error("Cloudflare token validation failed");
+  }
+
+  const accountResult = await cf(
+    "accounts/" + encodeURIComponent(accountId),
+    token
+  );
+
+  if (accountResult?.success === false || !accountResult?.result?.id) {
+    throw new Error("Cloudflare account could not be accessed");
+  }
+
+  return {
+    tokenStatus: result?.result?.status || "unknown",
+    accountId: accountResult.result.id,
+    accountName: accountResult.result.name || null
+  };
+}
+
+/* =========================================================
+   END OF PART 3
+   Add PART 4 below this line.
+========================================================= */
+
+/* =========================================================
+   PART 4A — CREATE GITHUB REPOSITORY
+========================================================= */
+
+async function createGithubRepository(token, repoName) {
+  if (!isValidIdentifier(repoName)) {
+    throw new Error("Invalid repository name");
+  }
+
+  const result = await github("user/repos", token, {
+    method: "POST",
+    body: JSON.stringify({
+      name: repoName,
+      description: "Trendify Nexus Relay Service",
+      private: true,
+      auto_init: true
+    })
+  });
+
+  if (!result?.full_name || !result?.owner?.login) {
+    throw new Error("GitHub did not return repository information");
+  }
+
+  return {
+    owner: result.owner.login,
+    name: result.name,
+    fullName: result.full_name,
+    url: result.html_url,
+    defaultBranch: result.default_branch || "main"
+  };
+}
+
+/* =========================================================
+   PART 4B — CREATE RAILWAY PROJECT FILES
+========================================================= */
+
+function buildRailwayFiles() {
+  const packageJson = {
+    name: "trendify-nexus-relay",
+    version: "1.0.0",
+    private: true,
+    description: "Trendify Nexus TCP Relay",
+    main: "server.js",
+    type: "commonjs",
+    scripts: {
+      start: "node server.js"
+    },
+    engines: {
+      node: ">=22"
+    }
+  };
+
+  const dockerfile = [
+    "FROM node:22-alpine",
+    "WORKDIR /app",
+    "COPY package.json ./",
+    "COPY server.js ./",
+    "ENV NODE_ENV=production",
+    "EXPOSE 443",
+    'CMD ["npm", "start"]',
+    ""
+  ].join("\n");
+
+  const railwayJson = {
+    "$schema": "https://railway.com/railway.schema.json",
+    build: {
+      builder: "DOCKERFILE",
+      dockerfilePath: "Dockerfile"
+    },
+    deploy: {
+      restartPolicyType: "ON_FAILURE",
+      restartPolicyMaxRetries: 10
+    }
+  };
+
+  const readme = [
+    "# Trendify Nexus Relay",
+    "",
+    "Node.js TCP relay for Trendify Nexus.",
+    "",
+    "## Required Railway variables",
+    "",
+    "- `PORT`: Railway service port",
+    "- `RELAY_SECRET`: shared secret used by the Gateway",
+    "",
+    "## Deployment",
+    "",
+    "1. Create a Railway service from this repository.",
+    "2. Set `RELAY_SECRET` to a long random value.",
+    "3. Configure a reachable TCP endpoint for the service.",
+    "4. Set the Gateway's `RELAY_HOST`, `RELAY_PORT`, and `RELAY_SECRET`.",
+    "",
+    "The relay protocol is custom and is not an HTTP server.",
+    ""
+  ].join("\n");
+
+  return {
+    "server.js": RELAY_SOURCE,
+    "package.json": JSON.stringify(packageJson, null, 2) + "\n",
+    "Dockerfile": dockerfile,
+    "railway.json": JSON.stringify(railwayJson, null, 2) + "\n",
+    "README.md": readme
+  };
+}
+
+/* =========================================================
+   PART 4C — UPLOAD PROJECT FILES
+========================================================= */
+
+async function uploadRailwayFiles({
+  token,
+  repository
+}) {
+  const files = buildRailwayFiles();
+
+  for (const [path, content] of Object.entries(files)) {
+    await putRepoFile({
+      token,
+      owner: repository.owner,
+      repo: repository.name,
+      path,
+      content,
+      branch: repository.defaultBranch,
+      message: "Add Trendify Nexus deployment file: " + path
+    });
+  }
+
+  return Object.keys(files);
+}
+
+/* =========================================================
+   PART 4D — RANDOM WORKER NAMES
+========================================================= */
+
+function createWorkerNames() {
+  return {
+    gatewayName: "nexus-gateway-" + randomHex(4),
+    botName: "nexus-bot-" + randomHex(4),
+    repositoryName: "trendify-nexus-relay-" + randomHex(4)
+  };
+}
+
+/* =========================================================
+   PART 4E — BUILD INSTALLATION RESPONSE
+========================================================= */
+
+function buildInstallResponse({
+  repository,
+  gatewayName,
+  botName,
+  relaySecret,
+  gatewayUUID,
+  webhookSecret
+}) {
+  return {
+    success: true,
+    app: APP_NAME,
+    version: APP_VERSION,
+    repository: {
+      name: repository.name,
+      url: repository.url
+    },
+    cloudflare: {
+      gatewayWorker: gatewayName,
+      gatewayUrl:
+        "https://" + gatewayName + ".workers.dev",
+      telegramBotWorker: botName,
+      telegramWebhookUrl:
+        "https://" + botName + ".workers.dev/telegram-webhook"
+    },
+    railway: {
+      note:
+        "Repository files are prepared. Create or connect a Railway service and configure its variables.",
+      requiredVariables: {
+        PORT: "443",
+        RELAY_SECRET: relaySecret
       }
+    },
+    gatewayVariables: {
+      UUID: gatewayUUID,
+      RELAY_HOST: "REPLACE_WITH_RAILWAY_TCP_HOST",
+      RELAY_PORT: "REPLACE_WITH_RAILWAY_TCP_PORT",
+      RELAY_SECRET: relaySecret,
+      GATEWAY_REGION: "eu"
+    },
+    telegram: {
+      webhookSecret,
+      note:
+        "Configure the bot Worker secrets and deploy it before registering its webhook."
+    }
+  };
+}
 
-      const body = Buffer.concat(chunks);
-      const method = req.method || "GET";
-      const url = new URL(
-        req.url || "/",
-        "http://localhost"
-      );
+/* =========================================================
+   END OF PART 4
+   Add PART 5 below this line.
+========================================================= */
 
-      if (method === "GET" && url.pathname === "/") {
-        res.writeHead(200, {
-          "Content-Type": "application/json; charset=utf-8",
-          "Cache-Control": "no-store",
-        });
-        res.end(JSON.stringify({
-          success: true,
-          service: "Trendify Nexus Installer",
-          status: "online",
-        }));
+/* =========================================================
+   PART 5A — CLOUDFLARE WORKERS SUBDOMAIN
+========================================================= */
+
+async function getWorkersSubdomain(accountId, token) {
+  const result = await cf(
+    "accounts/" + encodeURIComponent(accountId) + "/workers/subdomain",
+    token
+  );
+
+  const subdomain = result?.result?.subdomain;
+
+  if (!subdomain) {
+    throw new Error(
+      "Cloudflare Workers subdomain is unavailable. Enable workers.dev for this account first."
+    );
+  }
+
+  return subdomain;
+}
+
+/* =========================================================
+   PART 5B — GITHUB TOKEN VALIDATION
+========================================================= */
+
+async function validateGithubToken(token) {
+  const user = await github("user", token);
+
+  if (!user?.login) {
+    throw new Error("Could not verify GitHub account");
+  }
+
+  return {
+    login: user.login,
+    name: user.name || user.login
+  };
+}
+
+/* =========================================================
+   PART 5C — INSTALL HANDLER
+========================================================= */
+
+async function handleInstall(request) {
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: CORS_HEADERS
+    });
+  }
+
+  if (request.method !== "POST") {
+    return json({
+      success: false,
+      error: "Method not allowed"
+    }, 405);
+  }
+
+  let input;
+
+  try {
+    input = await readJson(request);
+  } catch (error) {
+    return json({
+      success: false,
+      error: errorMessage(error)
+    }, 400);
+  }
+
+  let credentials;
+
+  try {
+    credentials = validateInstallInput(input);
+  } catch (error) {
+    return json({
+      success: false,
+      error: errorMessage(error)
+    }, 400);
+  }
+
+  const {
+    githubToken,
+    cloudflareToken,
+    accountId,
+    telegramBotToken,
+    telegramAdminId
+  } = credentials;
+
+  try {
+    /* Validate external credentials */
+
+    const [githubUser, cloudflareAccount] = await Promise.all([
+      validateGithubToken(githubToken),
+      validateCloudflareToken(cloudflareToken, accountId)
+    ]);
+
+    /* Resolve account Workers subdomain */
+
+    const workersSubdomain = await getWorkersSubdomain(
+      accountId,
+      cloudflareToken
+    );
+
+    /* Generate installation identifiers and secrets */
+
+    const names = createWorkerNames();
+
+    const relaySecret = randomSecret(32);
+    const gatewayUUID = crypto.randomUUID();
+    const webhookSecret = randomHex(32);
+
+    /* Create GitHub repository */
+
+    const repository = await createGithubRepository(
+      githubToken,
+      names.repositoryName
+    );
+
+    const uploadedFiles = await uploadRailwayFiles({
+      token: githubToken,
+      repository
+    });
+
+    /* Deploy Gateway Worker */
+
+    await deployWorker({
+      accountId,
+      token: cloudflareToken,
+      workerName: names.gatewayName,
+      source: GATEWAY_SOURCE,
+      bindings: [
+        {
+          type: "plain_text",
+          name: "GATEWAY_ID",
+          text: crypto.randomUUID()
+        },
+        {
+          type: "plain_text",
+          name: "GATEWAY_REGION",
+          text: "eu"
+        },
+        {
+          type: "plain_text",
+          name: "RELAY_HOST",
+          text: "REPLACE_WITH_RAILWAY_TCP_HOST"
+        },
+        {
+          type: "plain_text",
+          name: "RELAY_PORT",
+          text: "443"
+        }
+      ]
+    });
+
+    await setWorkerSecret({
+      accountId,
+      token: cloudflareToken,
+      workerName: names.gatewayName,
+      secretName: "UUID",
+      secretValue: gatewayUUID
+    });
+
+    await setWorkerSecret({
+      accountId,
+      token: cloudflareToken,
+      workerName: names.gatewayName,
+      secretName: "RELAY_SECRET",
+      secretValue: relaySecret
+    });
+
+    /* Deploy Telegram Bot Worker */
+
+    await deployWorker({
+      accountId,
+      token: cloudflareToken,
+      workerName: names.botName,
+      source: BOT_SOURCE
+    });
+
+    await setWorkerSecret({
+      accountId,
+      token: cloudflareToken,
+      workerName: names.botName,
+      secretName: "TELEGRAM_BOT_TOKEN",
+      secretValue: telegramBotToken
+    });
+
+    await setWorkerSecret({
+      accountId,
+      token: cloudflareToken,
+      workerName: names.botName,
+      secretName: "TELEGRAM_ADMIN_ID",
+      secretValue: telegramAdminId
+    });
+
+    await setWorkerSecret({
+      accountId,
+      token: cloudflareToken,
+      workerName: names.botName,
+      secretName: "BOT_WEBHOOK_SECRET",
+      secretValue: webhookSecret
+    });
+
+    /* Register Telegram webhook */
+
+    const botWebhookUrl =
+      "https://" +
+      names.botName +
+      "." +
+      workersSubdomain +
+      ".workers.dev/telegram-webhook";
+
+    await setTelegramWebhook({
+      botToken: telegramBotToken,
+      webhookUrl: botWebhookUrl,
+      webhookSecret
+    });
+
+    /* Prepare installation response */
+
+    const output = buildInstallResponse({
+      repository,
+      gatewayName: names.gatewayName,
+      botName: names.botName,
+      relaySecret,
+      gatewayUUID,
+      webhookSecret
+    });
+
+    /* Do not expose the Telegram webhook secret */
+
+    if (output.telegram) {
+      delete output.telegram.webhookSecret;
+    }
+
+    output.github = {
+      username: githubUser.login
+    };
+
+    output.cloudflare = {
+      ...output.cloudflare,
+      accountName: cloudflareAccount.accountName,
+      workersSubdomain
+    };
+
+    output.repository.files = uploadedFiles;
+
+    output.nextSteps = [
+      "Create a Railway service from the generated GitHub repository.",
+      "Set RELAY_SECRET in Railway to the value returned in this response.",
+      "Configure a public TCP endpoint for the Railway relay.",
+      "Update the Gateway Worker RELAY_HOST and RELAY_PORT bindings to the actual Railway TCP endpoint.",
+      "Redeploy the Gateway Worker after updating its relay bindings."
+    ];
+
+    return json(output, 200);
+
+  } catch (error) {
+    console.error("Installer failed:", errorMessage(error));
+
+    return json({
+      success: false,
+      error: errorMessage(error),
+      message:
+        "Installation did not complete. Check the Railway logs and verify GitHub and Cloudflare permissions."
+    }, 500);
+  }
+}
+
+/* =========================================================
+   PART 5D — NODE.JS HTTP SERVER
+========================================================= */
+
+const server = http.createServer(async (req, res) => {
+  const requestUrl = new URL(
+    req.url || "/",
+    "http://localhost"
+  );
+
+  /* Health check */
+
+  if (
+    req.method === "GET" &&
+    (requestUrl.pathname === "/" ||
+      requestUrl.pathname === "/health")
+  ) {
+    const response = json({
+      success: true,
+      app: APP_NAME,
+      version: APP_VERSION,
+      status: "online",
+      runtime: process.version
+    });
+
+    res.writeHead(response.status, Object.fromEntries(response.headers));
+    res.end(await response.text());
+    return;
+  }
+
+  /* Browser preflight */
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, CORS_HEADERS);
+    res.end();
+    return;
+  }
+
+  /* Installer endpoint */
+
+  if (
+    requestUrl.pathname !== "/api/install" ||
+    req.method !== "POST"
+  ) {
+    const response = json({
+      success: false,
+      error: "Not Found",
+      installEndpoint: "POST /api/install"
+    }, 404);
+
+    res.writeHead(response.status, Object.fromEntries(response.headers));
+    res.end(await response.text());
+    return;
+  }
+
+  try {
+    const chunks = [];
+    let totalBytes = 0;
+
+    for await (const chunk of req) {
+      totalBytes += chunk.length;
+
+      if (totalBytes > 2 * 1024 * 1024) {
+        const response = json({
+          success: false,
+          error: "Request body exceeds 2 MB"
+        }, 413);
+
+        res.writeHead(response.status, Object.fromEntries(response.headers));
+        res.end(await response.text());
         return;
       }
 
-      const headers = new Headers();
+      chunks.push(chunk);
+    }
 
-      for (const [key, value] of Object.entries(req.headers)) {
-        if (value !== undefined) {
-          headers.set(
-            key,
-            Array.isArray(value) ? value.join(", ") : value
-          );
-        }
+    const body = Buffer.concat(chunks);
+
+    const headers = new Headers();
+
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (Array.isArray(value)) {
+        headers.set(key, value.join(", "));
+      } else if (value !== undefined) {
+        headers.set(key, String(value));
       }
+    }
 
-      const request = new Request(url, {
-        method,
+    const request = new Request(
+      "http://localhost/api/install",
+      {
+        method: "POST",
         headers,
-        ...(method !== "GET" && method !== "HEAD"
-          ? {
-              body,
-              duplex: "half",
-            }
-          : {}),
-      });
-
-      const response = await handleInstall(request);
-      const responseHeaders = {};
-
-      response.headers.forEach((value, key) => {
-        responseHeaders[key] = value;
-      });
-
-      res.writeHead(response.status, responseHeaders);
-      res.end(Buffer.from(await response.arrayBuffer()));
-    } catch (error) {
-      console.error("Installer server error:", error);
-
-      if (!res.headersSent) {
-        res.writeHead(500, {
-          "Content-Type": "application/json; charset=utf-8",
-          "Cache-Control": "no-store",
-        });
+        body
       }
+    );
+
+    const response = await handleInstall(request);
+
+    const responseHeaders = Object.fromEntries(response.headers);
+
+    res.writeHead(response.status, responseHeaders);
+    res.end(Buffer.from(await response.arrayBuffer()));
+
+  } catch (error) {
+    console.error("HTTP server error:", errorMessage(error));
+
+    if (!res.headersSent) {
+      res.writeHead(500, {
+        ...JSON_HEADERS,
+        ...CORS_HEADERS
+      });
 
       res.end(JSON.stringify({
         success: false,
-        message: "Internal server error",
+        error: "Internal server error"
       }));
+    } else {
+      res.end();
     }
-  })
-  .listen(Number(process.env.PORT || 3000), "0.0.0.0", () => {
-    console.log(
-      "Trendify Nexus Installer listening on port",
-      process.env.PORT || 3000
-    );
-  });
+  }
+});
+
+server.requestTimeout = 120000;
+server.headersTimeout = 15000;
+server.keepAliveTimeout = 5000;
+
+server.listen(PORT, HOST, () => {
+  console.log(
+    APP_NAME +
+    " v" + APP_VERSION +
+    " listening on " + HOST + ":" + PORT
+  );
+});
+
+/* =========================================================
+   END OF PART 5
+========================================================= */
