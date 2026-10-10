@@ -1,12 +1,13 @@
+
 {
   "name": "trendify-nexus-installer-v2",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "engines": {
-    "node": "22.x"
+    "node": ">=22"
   }
 }
