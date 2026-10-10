@@ -508,8 +508,7 @@ async function handleVLESS(request, env) {
   return new Response(null, { status: 101, webSocket: client, headers });
 }
 
-export default {
-  async fetch(request, env) {
+async function handleInstall(request) {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
@@ -964,5 +963,106 @@ export default {
         botWorkerName,
       }, 500);
     }
-  },
-};
+  }
+
+/* =========================
+   NODE.JS HTTP SERVER
+========================= */
+
+require("node:http")
+  .createServer(async (req, res) => {
+    try {
+      const chunks = [];
+      let totalSize = 0;
+      const maxBodySize = 2 * 1024 * 1024;
+
+      for await (const chunk of req) {
+        totalSize += chunk.length;
+
+        if (totalSize > maxBodySize) {
+          res.writeHead(413, {
+            "Content-Type": "application/json; charset=utf-8",
+          });
+          res.end(JSON.stringify({
+            success: false,
+            message: "Request body too large",
+          }));
+          return;
+        }
+
+        chunks.push(chunk);
+      }
+
+      const body = Buffer.concat(chunks);
+      const method = req.method || "GET";
+      const url = new URL(
+        req.url || "/",
+        "http://localhost"
+      );
+
+      if (method === "GET" && url.pathname === "/") {
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store",
+        });
+        res.end(JSON.stringify({
+          success: true,
+          service: "Trendify Nexus Installer",
+          status: "online",
+        }));
+        return;
+      }
+
+      const headers = new Headers();
+
+      for (const [key, value] of Object.entries(req.headers)) {
+        if (value !== undefined) {
+          headers.set(
+            key,
+            Array.isArray(value) ? value.join(", ") : value
+          );
+        }
+      }
+
+      const request = new Request(url, {
+        method,
+        headers,
+        ...(method !== "GET" && method !== "HEAD"
+          ? {
+              body,
+              duplex: "half",
+            }
+          : {}),
+      });
+
+      const response = await handleInstall(request);
+      const responseHeaders = {};
+
+      response.headers.forEach((value, key) => {
+        responseHeaders[key] = value;
+      });
+
+      res.writeHead(response.status, responseHeaders);
+      res.end(Buffer.from(await response.arrayBuffer()));
+    } catch (error) {
+      console.error("Installer server error:", error);
+
+      if (!res.headersSent) {
+        res.writeHead(500, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store",
+        });
+      }
+
+      res.end(JSON.stringify({
+        success: false,
+        message: "Internal server error",
+      }));
+    }
+  })
+  .listen(Number(process.env.PORT || 3000), "0.0.0.0", () => {
+    console.log(
+      "Trendify Nexus Installer listening on port",
+      process.env.PORT || 3000
+    );
+  });
