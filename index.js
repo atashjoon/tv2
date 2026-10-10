@@ -570,8 +570,7 @@ async function sendMessage(env, chatId, text) {
   if (!response.ok) throw new Error("Telegram sendMessage failed");
 }
 
-export default {
-  async fetch(request, env) {
+async function handleInstall(request) {
     const url = new URL(request.url);
 
     if (url.pathname === "/") {
