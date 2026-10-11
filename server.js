@@ -1,6 +1,6 @@
 import http from "node:http";
 import installer from "./index.js";
-
+console.log("Incoming request:", req.method, req.url);
 const server = http.createServer(async (req, res) => {
   try {
     const chunks = [];
