@@ -1271,12 +1271,12 @@ async function deployWorker(
   const form = new FormData();
 
   form.append(
-    "metadata",
-    new Blob(
-      [JSON.stringify(metadata)],
-      { type: "application/json" }
-    )
-  );
+  "metadata",
+  new Blob(
+    [JSON.stringify(metadata)],
+    { type: "application/json" }
+  )
+);
 
   form.append(
     "index.js",
@@ -1295,15 +1295,17 @@ async function deployWorker(
     }
   );
 
-  await cf(
-    `/accounts/${accountId}/workers/scripts/${workerName}/subdomain`,
-    token,
-    {
-      method: "POST",
-      body: JSON.stringify({ enabled: true })
-    }
-  );
-}
+ await cf(
+  `/accounts/${accountId}/workers/scripts/${workerName}/subdomain`,
+  token,
+  {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ enabled: true })
+  }
+);
 
 /* =====================================================
    5. INSTALLER API
