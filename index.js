@@ -1306,7 +1306,7 @@ async function deployWorker(
     body: JSON.stringify({ enabled: true })
   }
 );
-
+}
 /* =====================================================
    5. INSTALLER API
 ===================================================== */
