@@ -1,4 +1,4 @@
-```js
+
 import http from "node:http";
 import installer from "./index.js";
 
@@ -101,4 +101,4 @@ server.listen(PORT, "0.0.0.0", () => {
 server.on("error", error => {
   console.error("Installer HTTP server error:", error);
 });
-```
+
