@@ -22,6 +22,17 @@ function randomHex(bytes = 24) {
   ).join("");
 }
 
+function base64UTF8(value) {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+
+  for (let i = 0; i < bytes.length; i += 8192) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+  }
+
+  return btoa(binary);
+}
+
 async function github(url, token, options = {}) {
   return fetch(url, {
     ...options,
@@ -72,51 +83,283 @@ async function cf(path, token, options = {}) {
   return data.result;
 }
 
-async function putRepoFile(owner, repo, filePath, base64Content, token) {
-  const encodedPath = filePath
-    .split("/")
-    .map(encodeURIComponent)
-    .join("/");
-
+async function putRepoFile(owner, repo, path, content, token) {
   const url =
     "https://api.github.com/repos/" +
-    encodeURIComponent(owner) + "/" +
-    encodeURIComponent(repo) + "/contents/" +
-    encodedPath;
+    owner + "/" + repo + "/contents/" + path;
 
   const existing = await github(url, token);
   let sha;
 
   if (existing.ok) {
-    const current = await existing.json();
-    sha = current.sha;
+    sha = (await existing.json()).sha;
   } else if (existing.status !== 404) {
     throw new Error(
-      "GitHub read failed (" + filePath + "): " +
+      "GitHub read failed (" + path + "): " +
       await existing.text()
     );
   }
 
   const response = await github(url, token, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+    },
     body: JSON.stringify({
-      message: "Copy Trendify Nexus V2 backend: " + filePath,
-      content: base64Content,
+      message: "Create Trendify Nexus Relay files",
+      content: base64UTF8(content),
       ...(sha ? { sha } : {}),
     }),
   });
 
   if (!response.ok) {
     throw new Error(
-      "GitHub upload failed (" + filePath + "): " +
+      "GitHub upload failed (" + path + "): " +
       await response.text()
     );
   }
 }
 
 /* =====================================================
-   VLESS GATEWAY SOURCE
+   1. AUTHENTICATED TCP RELAY
+===================================================== */
+
+const RELAY_SOURCE = String.raw`
+import net from "node:net";
+import { timingSafeEqual } from "node:crypto";
+
+const PORT = Number(process.env.PORT || 443);
+const SECRET = String(process.env.RELAY_SECRET || "");
+const MAX_SECRET_LENGTH = 256;
+
+if (!SECRET) {
+  console.error("RELAY_SECRET is required");
+  process.exit(1);
+}
+
+const expectedSecret = Buffer.from(SECRET, "utf8");
+
+if (
+  expectedSecret.length < 16 ||
+  expectedSecret.length > MAX_SECRET_LENGTH
+) {
+  console.error("Invalid RELAY_SECRET length");
+  process.exit(1);
+}
+
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+  console.error("Invalid PORT");
+  process.exit(1);
+}
+
+const server = net.createServer(client => {
+  client.setNoDelay(true);
+
+  let remote = null;
+  let buffer = Buffer.alloc(0);
+  let stage = "secretLength";
+  let secretLength = 0;
+  let hostLength = 0;
+  let finished = false;
+  let connectTimer = null;
+
+  const timer = setTimeout(() => {
+    if (stage !== "connected") {
+      reject("Handshake timeout");
+    }
+  }, 10000);
+
+  function reject(reason) {
+    if (finished) return;
+
+    finished = true;
+    clearTimeout(timer);
+    clearTimeout(connectTimer);
+
+    console.log("REJECT:", reason);
+
+    client.destroy();
+    remote?.destroy();
+  }
+
+  function onData(chunk) {
+    if (finished) return;
+
+    buffer = Buffer.concat([buffer, chunk]);
+
+    while (true) {
+      if (stage === "secretLength") {
+        if (buffer.length < 2) return;
+
+        secretLength = buffer.readUInt16BE(0);
+        buffer = buffer.subarray(2);
+
+        if (
+          secretLength < 16 ||
+          secretLength > MAX_SECRET_LENGTH
+        ) {
+          return reject("Invalid secret length");
+        }
+
+        stage = "secret";
+      }
+
+      if (stage === "secret") {
+        if (buffer.length < secretLength) return;
+
+        const received = buffer.subarray(0, secretLength);
+        buffer = buffer.subarray(secretLength);
+
+        if (
+          received.length !== expectedSecret.length ||
+          !timingSafeEqual(received, expectedSecret)
+        ) {
+          return reject("Authentication failed");
+        }
+
+        stage = "hostLength";
+      }
+
+      if (stage === "hostLength") {
+        if (buffer.length < 2) return;
+
+        hostLength = buffer.readUInt16BE(0);
+        buffer = buffer.subarray(2);
+
+        if (hostLength < 1 || hostLength > 255) {
+          return reject("Invalid host length");
+        }
+
+        stage = "target";
+      }
+
+      if (stage === "target") {
+        if (buffer.length < hostLength + 2) return;
+
+        const host = buffer
+          .subarray(0, hostLength)
+          .toString("utf8");
+
+        const port = buffer.readUInt16BE(hostLength);
+        const payload = buffer.subarray(hostLength + 2);
+
+        buffer = Buffer.alloc(0);
+        stage = "connecting";
+
+        if (
+          !host ||
+          /[\0\r\n]/.test(host) ||
+          !Number.isInteger(port) ||
+          port < 1 ||
+          port > 65535
+        ) {
+          return reject("Invalid destination");
+        }
+
+        clearTimeout(timer);
+
+        client.pause();
+        client.removeListener("data", onData);
+
+        try {
+          remote = net.connect({ host, port });
+          remote.setNoDelay(true);
+
+          let acknowledged = false;
+
+          connectTimer = setTimeout(() => {
+            if (!acknowledged) {
+              console.log("REMOTE CONNECT TIMEOUT:", host, port);
+
+              if (!client.destroyed) {
+                client.end(Buffer.from([1]));
+              }
+
+              remote.destroy();
+            }
+          }, 10000);
+
+          remote.once("connect", () => {
+            if (finished) {
+              clearTimeout(connectTimer);
+              return remote.destroy();
+            }
+
+            acknowledged = true;
+            clearTimeout(connectTimer);
+
+            stage = "connected";
+
+            console.log("CONNECTED:", host, port);
+
+            client.write(Buffer.from([0]));
+
+            if (payload.length) {
+              remote.write(payload);
+            }
+
+            client.pipe(remote);
+            remote.pipe(client);
+            client.resume();
+          });
+
+          remote.on("error", err => {
+            console.log("REMOTE ERROR:", err.message);
+            clearTimeout(connectTimer);
+
+            if (!acknowledged && !client.destroyed) {
+              client.end(Buffer.from([1]));
+            } else {
+              client.destroy();
+            }
+          });
+
+          remote.on("close", () => {
+            clearTimeout(connectTimer);
+
+            if (!acknowledged && !client.destroyed) {
+              client.end(Buffer.from([1]));
+            } else if (!client.destroyed) {
+              client.destroy();
+            }
+          });
+        } catch (err) {
+          reject(err.message);
+        }
+
+        return;
+      }
+
+      return;
+    }
+  }
+
+  client.on("data", onData);
+
+  client.on("error", err => {
+    console.log("CLIENT ERROR:", err.message);
+    remote?.destroy();
+  });
+
+  client.on("close", () => {
+    finished = true;
+    clearTimeout(timer);
+    clearTimeout(connectTimer);
+    remote?.destroy();
+  });
+});
+
+server.on("error", err => {
+  console.error("SERVER ERROR:", err);
+  process.exitCode = 1;
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log("Authenticated TCP Relay listening on", PORT);
+});
+`;
+/* =====================================================
+   2. VLESS GATEWAY
 ===================================================== */
 
 const GATEWAY_SOURCE = String.raw`
@@ -253,21 +496,15 @@ function parseVLESS(bytes) {
     payload: bytes.slice(i)
   };
 }
+
 async function authorizeUUID(env, uuid) {
-  if (
-    !env.NEXUS_API_URL ||
-    !env.NEXUS_GATEWAY_SECRET ||
-    !env.GATEWAY_ID
-  ) {
+  if (!env.NEXUS_API_URL || !env.NEXUS_GATEWAY_SECRET || !env.GATEWAY_ID) {
     throw new Error("V2 backend authentication variables are missing");
   }
 
-  const endpoint =
-    env.NEXUS_API_URL.replace(/\/+$/, "") +
-    "/api/internal/gateway/auth?uuid=" +
-    encodeURIComponent(uuid) +
-    "&gateway_id=" +
-    encodeURIComponent(env.GATEWAY_ID);
+  const endpoint = env.NEXUS_API_URL.replace(/\/+$/, "") +
+    "/api/internal/gateway/auth?uuid=" + encodeURIComponent(uuid) +
+    "&gateway_id=" + encodeURIComponent(env.GATEWAY_ID);
 
   const response = await fetch(endpoint, {
     method: "GET",
@@ -302,7 +539,11 @@ async function handleVLESS(request, env) {
     !env.RELAY_PORT ||
     !env.NEXUS_API_URL ||
     !env.NEXUS_GATEWAY_SECRET ||
-    !env.GATEWAY_ID
+    !env.GATEWAY_ID ||
+    env.RELAY_HOST === "SET_RELAY_HOST" ||
+    env.NEXUS_API_URL === "SET_BACKEND_URL" ||
+    env.GATEWAY_ID === "SET_GATEWAY_ID" ||
+    env.NEXUS_GATEWAY_SECRET === "SET_NEXUS_GATEWAY_SECRET"
   ) {
     return new Response("Gateway environment is incomplete", {
       status: 503
@@ -318,7 +559,8 @@ async function handleVLESS(request, env) {
   let socket;
   let writer;
   let closed = false;
-    let chain = Promise.resolve();
+  let relayHandshakePending = true;
+  let chain = Promise.resolve();
 
   function closeAll() {
     if (closed) return;
@@ -408,19 +650,14 @@ async function handleVLESS(request, env) {
             return;
           }
 
-             // The current Railway relay does not send a handshake byte.
-    // Return the VLESS response header before forwarding relay data.
-    ws.send(new Uint8Array([parsed.version, 0]));
+          ws.send(new Uint8Array([parsed.version, 0]));
 
-    socket.readable.pipeTo(new WritableStream({
-      write(chunk) {
-        if (closed || ws.readyState !== WebSocket.OPEN) {
+          if (data.length > 1) {
+            ws.send(data.slice(1));
+          }
+
           return;
         }
-
-        const data = chunk instanceof Uint8Array
-          ? chunk
-          : new Uint8Array(chunk);
 
         if (data.length) {
           ws.send(data);
@@ -516,7 +753,7 @@ export default {
 `;
 
 /* =====================================================
-   CLOUDFLARE WORKER DEPLOYMENT
+   4. CLOUDFLARE WORKER DEPLOYMENT
 ===================================================== */
 
 async function deployWorker(
@@ -525,7 +762,8 @@ async function deployWorker(
   workerName,
   source,
   bindings = {},
-  secretNames = []
+  secretNames = [],
+  kvNamespaces = []
 ) {
   const textBindings = Object.entries(bindings).map(
     ([name, value]) => ({
@@ -537,10 +775,21 @@ async function deployWorker(
     })
   );
 
+  const namespaceBindings = kvNamespaces.map(
+    ({ name, namespaceId }) => ({
+      type: "kv_namespace",
+      name,
+      namespace_id: namespaceId
+    })
+  );
+
   const metadata = {
     main_module: "index.js",
     compatibility_date: "2026-10-10",
-    bindings: textBindings
+    bindings: [
+      ...textBindings,
+      ...namespaceBindings
+    ]
   };
 
   const form = new FormData();
@@ -582,30 +831,24 @@ async function deployWorker(
     }
   );
 }
+
 /* =====================================================
-   INSTALLER API
+   5. INSTALLER API — no Telegram bot
 ===================================================== */
 
 export default {
   async fetch(request) {
     if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: CORS
-      });
+      return new Response(null, { status: 204, headers: CORS });
     }
 
     if (request.method !== "POST") {
-      return json({
-        success: false,
-        message: "Method Not Allowed"
-      }, 405);
+      return json({ success: false, message: "Method Not Allowed" }, 405);
     }
 
     let repository = null;
-    let gatewayUrl = null;
-    let repoCreated = false;
     let workerName = null;
+    let repoCreated = false;
 
     try {
       let body;
@@ -622,60 +865,14 @@ export default {
       const githubToken = String(body.githubToken || "").trim();
       const cloudflareToken = String(body.cloudflareToken || "").trim();
       const accountId = String(body.accountId || "").trim();
-      const backendUrl = String(body.backendUrl || "")
-        .trim()
-        .replace(/\/+$/, "");
-      const gatewayId = String(body.gatewayId || "").trim();
-      const nexusGatewaySecret = String(
-        body.nexusGatewaySecret || ""
-      ).trim();
-      const relayHost = String(body.relayHost || "").trim();
-      const relayPort = Number(body.relayPort || 0);
-      const relaySecret = String(body.relaySecret || "").trim();
-      const sourceRepo = String(
-        body.backendRepository ||
-        "Trendiify/trendify-nexus-backend"
-      ).trim();
 
-      if (
-        !githubToken ||
-        !cloudflareToken ||
-        !accountId ||
-        !backendUrl ||
-        !/^\d+$/.test(gatewayId) ||
-        !nexusGatewaySecret ||
-        !relayHost ||
-        !Number.isInteger(relayPort) ||
-        relayPort < 1 ||
-        relayPort > 65535 ||
-        relaySecret.length < 16 ||
-        relaySecret.length > 256
-      ) {
+      if (!githubToken || !cloudflareToken || !accountId) {
         return json({
           success: false,
-          message:
-            "اطلاعات GitHub، Cloudflare، بک‌اند، Gateway ID و Relay را کامل و صحیح وارد کن."
+          message: "GitHub Token، Cloudflare API Token و Account ID الزامی هستند."
         }, 400);
       }
 
-      if (!/^https:\/\//i.test(backendUrl)) {
-        return json({
-          success: false,
-          message: "آدرس بک‌اند باید با https:// شروع شود."
-        }, 400);
-      }
-
-      if (
-        !/^[a-zA-Z0-9.-]+$/.test(relayHost) ||
-        relayHost.length > 253
-      ) {
-        return json({
-          success: false,
-          message: "آدرس Relay معتبر نیست."
-        }, 400);
-      }
-
-      /* 1. Verify Cloudflare token */
       const tokenCheck = await cf(
         "/user/tokens/verify",
         cloudflareToken
@@ -685,7 +882,6 @@ export default {
         throw new Error("Cloudflare API Token فعال نیست.");
       }
 
-      /* 2. Verify GitHub token */
       const userResponse = await github(
         "https://api.github.com/user",
         githubToken
@@ -693,17 +889,15 @@ export default {
 
       if (!userResponse.ok) {
         throw new Error(
-          "GitHub Token معتبر نیست یا دسترسی لازم را ندارد."
+          "GitHub Token معتبر نیست یا دسترسی ساخت Repository ندارد."
         );
       }
 
       const githubUser = await userResponse.json();
       const owner = githubUser.login;
 
-      /* 3. Get workers.dev subdomain */
       const accountInfo = await cf(
-        "/accounts/" + encodeURIComponent(accountId) +
-        "/workers/subdomain",
+        "/accounts/" + encodeURIComponent(accountId) + "/workers/subdomain",
         cloudflareToken
       );
 
@@ -711,134 +905,24 @@ export default {
 
       if (!subdomain) {
         throw new Error(
-          "ابتدا دامنه workers.dev را برای این حساب Cloudflare فعال کن."
+          "ابتدا workers.dev subdomain را در Cloudflare فعال کن."
         );
       }
 
-      /* 4. Verify backend authentication endpoint */
-      const authProbe = await fetch(
-        backendUrl +
-        "/api/internal/gateway/auth?uuid=" +
-        encodeURIComponent("00000000-0000-4000-8000-000000000000") +
-        "&gateway_id=" +
-        encodeURIComponent(gatewayId),
-        {
-          headers: {
-            "X-Nexus-Gateway-Secret": nexusGatewaySecret
-          }
-        }
-      );
-
-      if (authProbe.status === 401) {
-        throw new Error(
-          "Secret بک‌اند اشتباه است یا با NEXUS_GATEWAY_SECRET یکی نیست."
-        );
-      }
-
-      if (!authProbe.ok) {
-        throw new Error(
-          "مسیر احراز هویت بک‌اند پاسخ معتبر نداد: " +
-          authProbe.status
-        );
-      }
-
-      const probeData = await authProbe.json().catch(() => null);
-
-      if (
-        !probeData ||
-        typeof probeData.authorized !== "boolean"
-      ) {
-        throw new Error(
-          "پاسخ احراز هویت با نسخه V2 بک‌اند سازگار نیست."
-        );
-      }
-
-      /* 5. Validate source repository */
-      const src = sourceRepo.split("/");
-
-      if (
-        src.length !== 2 ||
-        !src[0] ||
-        !src[1]
-      ) {
-        throw new Error(
-          "ریپازیتوری بک‌اند باید به شکل owner/repo باشد."
-        );
-      }
-
-      const sourceMetaRes = await github(
-        "https://api.github.com/repos/" +
-        encodeURIComponent(src[0]) + "/" +
-        encodeURIComponent(src[1]),
-        githubToken
-      );
-
-      if (!sourceMetaRes.ok) {
-        throw new Error(
-          "ریپازیتوری مبدا قابل خواندن نیست: " +
-          await sourceMetaRes.text()
-        );
-      }
-
-      const sourceMeta = await sourceMetaRes.json();
-      const branch = sourceMeta.default_branch || "main";
-
-      const treeRes = await github(
-        "https://api.github.com/repos/" +
-        encodeURIComponent(src[0]) + "/" +
-        encodeURIComponent(src[1]) +
-        "/git/trees/" +
-        encodeURIComponent(branch) +
-        "?recursive=1",
-        githubToken
-      );
-
-      if (!treeRes.ok) {
-        throw new Error(
-          "خواندن فهرست فایل‌های بک‌اند ناموفق بود: " +
-          await treeRes.text()
-        );
-      }
-
-      const tree = await treeRes.json();
-
-      if (tree.truncated) {
-        throw new Error(
-          "فهرست فایل‌های ریپازیتوری بیش از حد بزرگ است؛ کپی خودکار متوقف شد."
-        );
-      }
-
-      const blocked =
-        /(^|\/)(\.git|node_modules|\.env(?:\..*)?|coverage|\.wrangler)(\/|$)|(^|\/)(\.DS_Store|npm-debug\.log)$/i;
-
-      const sourceFiles = (tree.tree || []).filter(
-        file =>
-          file.type === "blob" &&
-          !blocked.test(file.path)
-      );
-
-      if (!sourceFiles.length) {
-        throw new Error(
-          "هیچ فایل قابل کپی در ریپازیتوری مبدا پیدا نشد."
-        );
-      }
-
-      /* 6. Create private destination repository */
-      const repoName = "trendify-nexus-v2-" + randomHex(5);
+      const repoName = "nexus-relay-" + randomHex(5);
+      workerName = "nexus-gw-" + randomHex(5);
+      const relaySecret = randomHex(32);
 
       const createRepo = await github(
         "https://api.github.com/user/repos",
         githubToken,
         {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             name: repoName,
-            description:
-              "Trendify Nexus V2 backend copy created by installer",
-            private: true,
+            description: "Trendify Nexus authenticated TCP relay",
+            private: false,
             auto_init: true
           })
         }
@@ -846,75 +930,73 @@ export default {
 
       if (!createRepo.ok) {
         throw new Error(
-          "ساخت ریپازیتوری خصوصی ناموفق بود: " +
+          "ساخت Repository ریلے در GitHub ناموفق بود: " +
           await createRepo.text()
         );
       }
 
       repoCreated = true;
-      repository =
-        "https://github.com/" + owner + "/" + repoName;
+      repository = "https://github.com/" + owner + "/" + repoName;
 
-      /* 7. Copy source files without Base64 corruption */
-      for (const file of sourceFiles) {
-        const contentUrl =
-          "https://api.github.com/repos/" +
-          encodeURIComponent(src[0]) + "/" +
-          encodeURIComponent(src[1]) + "/contents/" +
-          file.path
-            .split("/")
-            .map(encodeURIComponent)
-            .join("/") +
-          "?ref=" + encodeURIComponent(branch);
+      const packageJson = JSON.stringify({
+        name: repoName,
+        version: "1.0.0",
+        private: true,
+        type: "module",
+        main: "server.js",
+        scripts: { start: "node server.js" },
+        engines: { node: ">=20" }
+      }, null, 2);
 
-        const contentRes = await github(
-          contentUrl,
-          githubToken
-        );
+      const dockerfile = [
+        "FROM node:22-alpine",
+        "WORKDIR /app",
+        "COPY package.json .",
+        "COPY server.js .",
+        "EXPOSE 443",
+        'CMD ["npm", "start"]'
+      ].join("\n");
 
-        if (!contentRes.ok) {
-          throw new Error(
-            "خواندن فایل " + file.path + " ناموفق بود: " +
-            await contentRes.text()
-          );
+      const railwayJson = JSON.stringify({
+        $schema: "https://railway.app/railway.schema.json",
+        deploy: {
+          startCommand: "npm start",
+          restartPolicyType: "ON_FAILURE",
+          restartPolicyMaxRetries: 10
         }
+      }, null, 2);
 
-        const contentJson = await contentRes.json();
+      const readme = [
+        "# Trendify Nexus TCP Relay",
+        "",
+        "## Railway variables",
+        "- PORT=443",
+        "- RELAY_SECRET: copy the value shown by the Installer",
+        "",
+        "## Setup",
+        "1. Deploy this repository to Railway.",
+        "2. Set PORT=443 and RELAY_SECRET.",
+        "3. Create a TCP Proxy targeting internal port 443.",
+        "4. Add the TCP proxy host and port to the Gateway Worker variables.",
+        "5. Complete the V2 backend variables in the Gateway Worker before using it.",
+        "",
+        "Never publish RELAY_SECRET."
+      ].join("\n");
 
-        if (
-          contentJson.type !== "file" ||
-          typeof contentJson.content !== "string"
-        ) {
-          throw new Error(
-            "محتوای فایل از GitHub دریافت نشد: " +
-            file.path
-          );
-        }
+      const files = {
+        "server.js": RELAY_SOURCE,
+        "package.json": packageJson,
+        "Dockerfile": dockerfile,
+        "railway.json": railwayJson,
+        "README.md": readme
+      };
 
-        const base64Content =
-          contentJson.content.replace(/\s/g, "");
-
-        if (!base64Content) {
-          throw new Error(
-            "محتوای فایل خالی یا غیرقابل‌خواندن است: " +
-            file.path
-          );
-        }
-
-        await putRepoFile(
-          owner,
-          repoName,
-          file.path,
-          base64Content,
-          githubToken
-        );
+      for (const [path, content] of Object.entries(files)) {
+        await putRepoFile(owner, repoName, path, content, githubToken);
       }
 
-      /* 8. Deploy Cloudflare Gateway Worker */
-      workerName = "nexus-gw-" + randomHex(5);
-      gatewayUrl =
-        "https://" + workerName + "." +
-        subdomain + ".workers.dev";
+      const gatewayUrl =
+        "https://" + workerName + "." + subdomain + ".workers.dev";
 
       await deployWorker(
         accountId,
@@ -922,39 +1004,33 @@ export default {
         workerName,
         GATEWAY_SOURCE,
         {
-          RELAY_HOST: relayHost,
-          RELAY_PORT: String(relayPort),
+          RELAY_HOST: "SET_RELAY_HOST",
+          RELAY_PORT: "443",
           RELAY_SECRET: relaySecret,
-          GATEWAY_ID: gatewayId,
-          GATEWAY_REGION: String(body.region || "eu"),
-          NEXUS_API_URL: backendUrl,
-          NEXUS_GATEWAY_SECRET: nexusGatewaySecret
+          GATEWAY_ID: "SET_GATEWAY_ID",
+          GATEWAY_REGION: "eu",
+          NEXUS_API_URL: "SET_BACKEND_URL",
+          NEXUS_GATEWAY_SECRET: "SET_NEXUS_GATEWAY_SECRET"
         },
-        [
-          "RELAY_SECRET",
-          "NEXUS_GATEWAY_SECRET"
-        ]
+        ["RELAY_SECRET", "NEXUS_GATEWAY_SECRET"]
       );
 
       return json({
         success: true,
-        message:
-          "ریپازیتوری بک‌اند کپی شد و Gateway Worker ایجاد شد.",
-        backendRepository: repository,
-        sourceBackendRepository: sourceRepo,
+        message: "Repository ریلے و Gateway ساخته شدند. برای استفاده، مراحل دستی پایین را کامل کن.",
+        repository,
         gatewayName: workerName,
         gatewayUrl,
-        gatewayId: Number(gatewayId),
-        relay: {
-          host: relayHost,
-          port: relayPort,
-          configured: true
-        },
+        relaySecret,
         nextSteps: [
-          "ریپازیتوری خصوصی بک‌اند را در میزبان بک‌اند خودت Deploy کن؛ اینستالر سرویس Railway نمی‌سازد.",
-          "Gateway ID باید مربوط به Gateway واقعی و فعال در دیتابیس V2 باشد.",
-          "مسیر WebSocket گیتوی: " + gatewayUrl + "/ws",
-          "مقادیر Secret در تنظیمات Worker ثبت می‌شوند و داخل ریپازیتوری قرار نمی‌گیرند."
+          "Repository بالا را در Railway Deploy کن.",
+          "در Railway Variables مقدار PORT=443 و RELAY_SECRET را با مقدار نمایش‌داده‌شده تنظیم کن.",
+          "در Railway یک TCP Proxy بساز و Host و Port عمومی آن را یادداشت کن.",
+          "در Cloudflare Worker با نام " + workerName + " متغیرهای RELAY_HOST و RELAY_PORT را با Host و Port پروکسی جایگزین کن.",
+          "متغیر NEXUS_API_URL را برابر آدرس عمومی بک‌اند V2 قرار بده.",
+          "متغیر GATEWAY_ID را با شناسه عددی Gateway ثبت‌شده در دیتابیس V2 جایگزین کن.",
+          "متغیر NEXUS_GATEWAY_SECRET را با Secret داخلی بک‌اند V2 تنظیم کن.",
+          "تا تکمیل این متغیرها، Gateway آماده اتصال کاربران نیست."
         ]
       });
     } catch (error) {
@@ -963,8 +1039,7 @@ export default {
         message: error?.message || "Installer failed",
         repositoryMayHaveBeenCreated: repoCreated,
         repository,
-        workerName,
-        gatewayUrl
+        workerName
       }, 500);
     }
   }
