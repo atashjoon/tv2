@@ -119,7 +119,96 @@ async function putRepoFile(owner, repo, path, content, token) {
     );
   }
 }
+async function createGitHubRepo(token, name, description) {
+  const response = await github(
+    "https://api.github.com/user/repos",
+    token,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name,
+        description,
+        private: false,
+        auto_init: true
+      })
+    }
+  );
 
+  if (!response.ok) {
+    throw new Error(
+      "GitHub repository creation failed: " +
+      await response.text()
+    );
+  }
+
+  return response.json();
+}
+
+async function copyBackendTemplate(token, owner, targetRepo) {
+  const templateOwner = "Trendiify";
+  const templateRepo = "trendify-nexus-backend";
+  const branch = "main";
+
+  const response = await github(
+    `https://api.github.com/repos/${templateOwner}/${templateRepo}/git/trees/${branch}?recursive=1`,
+    token
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      "خواندن مخزن قالب بک‌اند ناموفق بود: " +
+      await response.text()
+    );
+  }
+
+  const tree = await response.json();
+
+  if (!Array.isArray(tree.tree)) {
+    throw new Error("ساختار فایل‌های مخزن بک‌اند معتبر نیست.");
+  }
+
+  const files = tree.tree.filter(file =>
+    file.type === "blob" &&
+    !file.path.startsWith(".git/") &&
+    !file.path.startsWith("node_modules/") &&
+    !file.path.split("/").some(part =>
+      part === "node_modules" || part === ".git"
+    ) &&
+    ![".env", ".env.local", ".env.production"].includes(file.path) &&
+    !file.path.endsWith(".pem") &&
+    !file.path.endsWith(".key")
+  );
+
+  if (!files.length) {
+    throw new Error("هیچ فایلی برای کپی از مخزن بک‌اند پیدا نشد.");
+  }
+
+  for (const file of files) {
+    const rawUrl =
+      `https://raw.githubusercontent.com/${templateOwner}/${templateRepo}/${branch}/${file.path}`;
+
+    const fileResponse = await fetch(rawUrl);
+
+    if (!fileResponse.ok) {
+      throw new Error(
+        `خواندن فایل ${file.path} ناموفق بود.`
+      );
+    }
+
+    const content = await fileResponse.text();
+
+    await putRepoFile(
+      owner,
+      targetRepo,
+      file.path,
+      content,
+      token
+    );
+  }
+
+  return files.length;
+}
 /* =====================================================
    1. AUTHENTICATED TCP RELAY
 ===================================================== */
@@ -833,22 +922,29 @@ async function deployWorker(
 }
 
 /* =====================================================
-   5. INSTALLER API — no Telegram bot
+   5. INSTALLER API
+   Creates backend and relay repositories.
+   Does NOT deploy a Cloudflare Gateway Worker.
 ===================================================== */
 
 export default {
   async fetch(request) {
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS });
+      return new Response(null, {
+        status: 204,
+        headers: CORS
+      });
     }
 
     if (request.method !== "POST") {
-      return json({ success: false, message: "Method Not Allowed" }, 405);
+      return json({
+        success: false,
+        message: "Method Not Allowed"
+      }, 405);
     }
 
-    let repository = null;
-    let workerName = null;
-    let repoCreated = false;
+    let backendRepository = null;
+    let relayRepository = null;
 
     try {
       let body;
@@ -869,7 +965,7 @@ export default {
       if (!githubToken || !cloudflareToken || !accountId) {
         return json({
           success: false,
-          message: "GitHub Token، Cloudflare API Token و Account ID الزامی هستند."
+          message: "هر سه فیلد الزامی هستند."
         }, 400);
       }
 
@@ -889,63 +985,66 @@ export default {
 
       if (!userResponse.ok) {
         throw new Error(
-          "GitHub Token معتبر نیست یا دسترسی ساخت Repository ندارد."
+          "GitHub Token معتبر نیست یا مجوز ساخت Repository ندارد."
         );
       }
 
       const githubUser = await userResponse.json();
       const owner = githubUser.login;
 
-      const accountInfo = await cf(
-        "/accounts/" + encodeURIComponent(accountId) + "/workers/subdomain",
-        cloudflareToken
+      /*
+       * 1. Create backend repository from the existing
+       * Trendify Nexus V2 backend template.
+       */
+
+      const backendName =
+        "trendify-nexus-backend-" + randomHex(5);
+
+      await createGitHubRepo(
+        githubToken,
+        backendName,
+        "Trendify Nexus V2 Backend"
       );
 
-      const subdomain = accountInfo.subdomain;
+      backendRepository =
+        `https://github.com/${owner}/${backendName}`;
 
-      if (!subdomain) {
-        throw new Error(
-          "ابتدا workers.dev subdomain را در Cloudflare فعال کن."
-        );
-      }
+      const copiedFiles = await copyBackendTemplate(
+        githubToken,
+        owner,
+        backendName
+      );
 
-      const repoName = "nexus-relay-" + randomHex(5);
-      workerName = "nexus-gw-" + randomHex(5);
+      /*
+       * 2. Create the TCP relay repository.
+       */
+
+      const relayName =
+        "trendify-nexus-relay-" + randomHex(5);
+
+      await createGitHubRepo(
+        githubToken,
+        relayName,
+        "Trendify Nexus Authenticated TCP Relay"
+      );
+
+      relayRepository =
+        `https://github.com/${owner}/${relayName}`;
+
       const relaySecret = randomHex(32);
 
-      const createRepo = await github(
-        "https://api.github.com/user/repos",
-        githubToken,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            name: repoName,
-            description: "Trendify Nexus authenticated TCP relay",
-            private: false,
-            auto_init: true
-          })
-        }
-      );
-
-      if (!createRepo.ok) {
-        throw new Error(
-          "ساخت Repository ریلے در GitHub ناموفق بود: " +
-          await createRepo.text()
-        );
-      }
-
-      repoCreated = true;
-      repository = "https://github.com/" + owner + "/" + repoName;
-
       const packageJson = JSON.stringify({
-        name: repoName,
+        name: relayName,
         version: "1.0.0",
         private: true,
         type: "module",
         main: "server.js",
-        scripts: { start: "node server.js" },
-        engines: { node: ">=20" }
+        scripts: {
+          start: "node server.js"
+        },
+        engines: {
+          node: ">=20"
+        }
       }, null, 2);
 
       const dockerfile = [
@@ -969,21 +1068,20 @@ export default {
       const readme = [
         "# Trendify Nexus TCP Relay",
         "",
-        "## Railway variables",
-        "- PORT=443",
-        "- RELAY_SECRET: copy the value shown by the Installer",
+        "## Railway Variables",
+        "PORT=443",
+        "RELAY_SECRET=<secret provided by the installer>",
         "",
         "## Setup",
         "1. Deploy this repository to Railway.",
-        "2. Set PORT=443 and RELAY_SECRET.",
-        "3. Create a TCP Proxy targeting internal port 443.",
-        "4. Add the TCP proxy host and port to the Gateway Worker variables.",
-        "5. Complete the V2 backend variables in the Gateway Worker before using it.",
+        "2. Set PORT and RELAY_SECRET.",
+        "3. Create a Railway TCP Proxy targeting port 443.",
+        "4. Configure the relay host and port in the backend-managed Gateway.",
         "",
-        "Never publish RELAY_SECRET."
+        "Keep RELAY_SECRET private."
       ].join("\n");
 
-      const files = {
+      const relayFiles = {
         "server.js": RELAY_SOURCE,
         "package.json": packageJson,
         "Dockerfile": dockerfile,
@@ -991,55 +1089,47 @@ export default {
         "README.md": readme
       };
 
-      for (const [path, content] of Object.entries(files)) {
-        await putRepoFile(owner, repoName, path, content, githubToken);
+      for (const [path, content] of Object.entries(relayFiles)) {
+        await putRepoFile(
+          owner,
+          relayName,
+          path,
+          content,
+          githubToken
+        );
       }
 
-      const gatewayUrl =
-        "https://" + workerName + "." + subdomain + ".workers.dev";
-
-      await deployWorker(
-        accountId,
-        cloudflareToken,
-        workerName,
-        GATEWAY_SOURCE,
-        {
-          RELAY_HOST: "SET_RELAY_HOST",
-          RELAY_PORT: "443",
-          RELAY_SECRET: relaySecret,
-          GATEWAY_ID: "SET_GATEWAY_ID",
-          GATEWAY_REGION: "eu",
-          NEXUS_API_URL: "SET_BACKEND_URL",
-          NEXUS_GATEWAY_SECRET: "SET_NEXUS_GATEWAY_SECRET"
-        },
-        ["RELAY_SECRET", "NEXUS_GATEWAY_SECRET"]
-      );
+      /*
+       * IMPORTANT:
+       * No deployWorker() call here.
+       * Gateway creation remains the responsibility
+       * of the V2 backend.
+       */
 
       return json({
         success: true,
-        message: "Repository ریلے و Gateway ساخته شدند. برای استفاده، مراحل دستی پایین را کامل کن.",
-        repository,
-        gatewayName: workerName,
-        gatewayUrl,
+        message: "مخزن بک‌اند و ریلے ساخته شدند.",
+        backendRepository,
+        relayRepository,
         relaySecret,
+        backendFilesCopied: copiedFiles,
         nextSteps: [
-          "Repository بالا را در Railway Deploy کن.",
-          "در Railway Variables مقدار PORT=443 و RELAY_SECRET را با مقدار نمایش‌داده‌شده تنظیم کن.",
-          "در Railway یک TCP Proxy بساز و Host و Port عمومی آن را یادداشت کن.",
-          "در Cloudflare Worker با نام " + workerName + " متغیرهای RELAY_HOST و RELAY_PORT را با Host و Port پروکسی جایگزین کن.",
-          "متغیر NEXUS_API_URL را برابر آدرس عمومی بک‌اند V2 قرار بده.",
-          "متغیر GATEWAY_ID را با شناسه عددی Gateway ثبت‌شده در دیتابیس V2 جایگزین کن.",
-          "متغیر NEXUS_GATEWAY_SECRET را با Secret داخلی بک‌اند V2 تنظیم کن.",
-          "تا تکمیل این متغیرها، Gateway آماده اتصال کاربران نیست."
+          "مخزن بک‌اند ساخته‌شده را در Railway مستقر کن.",
+          "PostgreSQL و DATABASE_URL را برای بک‌اند تنظیم کن.",
+          "متغیرهای Cloudflare موردنیاز بک‌اند را در Railway تنظیم کن.",
+          "مخزن Relay را در Railway مستقر کن.",
+          "در Relay متغیرهای PORT=443 و RELAY_SECRET را تنظیم کن.",
+          "TCP Proxy را در Railway ایجاد کن.",
+          "از طریق بک‌اند، Gateway را ایجاد و تنظیم کن."
         ]
       });
+
     } catch (error) {
       return json({
         success: false,
         message: error?.message || "Installer failed",
-        repositoryMayHaveBeenCreated: repoCreated,
-        repository,
-        workerName
+        backendRepository,
+        relayRepository
       }, 500);
     }
   }
