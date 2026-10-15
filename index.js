@@ -318,8 +318,7 @@ async function handleVLESS(request, env) {
   let socket;
   let writer;
   let closed = false;
-  let relayHandshakePending = true;
-  let chain = Promise.resolve();
+    let chain = Promise.resolve();
 
   function closeAll() {
     if (closed) return;
@@ -409,14 +408,19 @@ async function handleVLESS(request, env) {
             return;
           }
 
-          ws.send(new Uint8Array([parsed.version, 0]));
+             // The current Railway relay does not send a handshake byte.
+    // Return the VLESS response header before forwarding relay data.
+    ws.send(new Uint8Array([parsed.version, 0]));
 
-          if (data.length > 1) {
-            ws.send(data.slice(1));
-          }
-
+    socket.readable.pipeTo(new WritableStream({
+      write(chunk) {
+        if (closed || ws.readyState !== WebSocket.OPEN) {
           return;
         }
+
+        const data = chunk instanceof Uint8Array
+          ? chunk
+          : new Uint8Array(chunk);
 
         if (data.length) {
           ws.send(data);
