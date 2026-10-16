@@ -120,6 +120,7 @@ async function putRepoFile(owner, repo, path, content, token) {
   }
 }
 
+
 async function fetchRelaySource() {
   const url =
     "https://raw.githubusercontent.com/Trendiify/Trendify-nexus-relay/main/server.js";
@@ -137,21 +138,90 @@ async function fetchRelaySource() {
     );
   }
 
-  const source = await response.text();
+  let source = await response.text();
 
   if (
-    !source.includes("node:net") ||
-    !source.includes("RELAY_SECRET") ||
+    !source.includes('import net from "node:net"') ||
     !source.includes("timingSafeEqual") ||
-    !/client\.write\s*\(\s*Buffer\.from\s*\(\s*\[\s*0\s*\]\s*\)\s*\)/.test(source)
+    !source.includes("RELAY_SECRET") ||
+    !source.includes('stage = "connected";')
   ) {
     throw new Error(
-      "سورس مخزن اصلی با پروتکل فعلی Gateway سازگار نیست؛ نصب متوقف شد."
+      "سورس اصلی Relay ساختار مورد انتظار را ندارد."
+    );
+  }
+
+  const connectMarker =
+    'stage = "connected";\n            console.log("TARGET CONNECTED:", host, port);';
+
+  if (!source.includes(connectMarker)) {
+    throw new Error(
+      "محل تأیید اتصال در سورس Relay پیدا نشد؛ نصب متوقف شد."
+    );
+  }
+
+  source = source.replace(
+    connectMarker,
+    'stage = "connected";\n' +
+    '            client.write(Buffer.from([0]));\n' +
+    '            console.log("TARGET CONNECTED:", host, port);'
+  );
+
+  const errorMarker =
+    'remote.on("error", (err) => {\n' +
+    '            console.log("REMOTE ERROR:", err.message);\n' +
+    '            client.destroy();\n' +
+    '          });';
+
+  if (!source.includes(errorMarker)) {
+    throw new Error(
+      "مدیریت خطای اتصال در سورس Relay پیدا نشد."
+    );
+  }
+
+  source = source.replace(
+    errorMarker,
+    'remote.on("error", (err) => {\n' +
+    '            console.log("REMOTE ERROR:", err.message);\n' +
+    '            if (stage !== "connected" && !client.destroyed) {\n' +
+    '              client.end(Buffer.from([1]));\n' +
+    '            } else {\n' +
+    '              client.destroy();\n' +
+    '            }\n' +
+    '          });'
+  );
+
+  const closeMarker =
+    'remote.on("close", () => {\n' +
+    '            client.destroy();\n' +
+    '          });';
+
+  if (!source.includes(closeMarker)) {
+    throw new Error(
+      "مدیریت بسته‌شدن اتصال در سورس Relay پیدا نشد."
+    );
+  }
+
+  source = source.replace(
+    closeMarker,
+    'remote.on("close", () => {\n' +
+    '            if (stage !== "connected" && !client.destroyed) {\n' +
+    '              client.end(Buffer.from([1]));\n' +
+    '            } else {\n' +
+    '              client.destroy();\n' +
+    '            }\n' +
+    '          });'
+  );
+
+  if (!source.includes("client.write(Buffer.from([0]))")) {
+    throw new Error(
+      "تأیید اتصال موفق در سورس Relay اضافه نشد."
     );
   }
 
   return source;
 }
+
 
 async function createGitHubRepo(token, name, description) {
   const response = await github(
@@ -1118,6 +1188,9 @@ export default {
       
       const relaySource = await fetchRelaySource();
 
+      
+      const relaySource = await fetchRelaySource();
+
       const relayFiles = {
         "server.js": relaySource,
         "package.json": packageJson,
@@ -1135,6 +1208,7 @@ export default {
           githubToken
         );
       }
+
 
 
       /*
