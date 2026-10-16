@@ -1186,9 +1186,7 @@ export default {
       ].join("\n");
 
       
-      const relaySource = await fetchRelaySource();
-
-      
+            
       const relaySource = await fetchRelaySource();
 
       const relayFiles = {
