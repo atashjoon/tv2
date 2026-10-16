@@ -119,6 +119,40 @@ async function putRepoFile(owner, repo, path, content, token) {
     );
   }
 }
+
+async function fetchRelaySource() {
+  const url =
+    "https://raw.githubusercontent.com/Trendiify/Trendify-nexus-relay/main/server.js";
+
+  const response = await fetch(url, {
+    headers: {
+      "Accept": "text/plain",
+      "Cache-Control": "no-cache"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `دریافت سورس اصلی Relay ناموفق بود: HTTP ${response.status}`
+    );
+  }
+
+  const source = await response.text();
+
+  if (
+    !source.includes("node:net") ||
+    !source.includes("RELAY_SECRET") ||
+    !source.includes("timingSafeEqual") ||
+    !/client\.write\s*\(\s*Buffer\.from\s*\(\s*\[\s*0\s*\]\s*\)\s*\)/.test(source)
+  ) {
+    throw new Error(
+      "سورس مخزن اصلی با پروتکل فعلی Gateway سازگار نیست؛ نصب متوقف شد."
+    );
+  }
+
+  return source;
+}
+
 async function createGitHubRepo(token, name, description) {
   const response = await github(
     "https://api.github.com/user/repos",
@@ -1081,8 +1115,11 @@ export default {
         "Keep RELAY_SECRET private."
       ].join("\n");
 
+      
+      const relaySource = await fetchRelaySource();
+
       const relayFiles = {
-        "server.js": RELAY_SOURCE,
+        "server.js": relaySource,
         "package.json": packageJson,
         "Dockerfile": dockerfile,
         "railway.json": railwayJson,
@@ -1098,6 +1135,7 @@ export default {
           githubToken
         );
       }
+
 
       /*
        * IMPORTANT:
